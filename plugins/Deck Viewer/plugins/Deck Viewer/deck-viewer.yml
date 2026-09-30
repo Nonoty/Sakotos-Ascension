@@ -10,12 +10,10 @@ settings:
     displayName: Transition Effect
     description: 'Swiper effect: slide, fade, cards, coverflow, flip, cube (default: cards)'
     type: STRING
-
   showCounter:
-    displayName: Show Counter
-    description: 'Display "3 of 150" counter (default: enabled)'
+    displayName: Disable Counter
+    description: 'Disable Gallery and Image counters'
     type: BOOLEAN
-
   ambientColorHue:
     displayName: Ambient Glow Hue
     description: 'Background ambient glow hue (0-360, default: 260 = purple)'

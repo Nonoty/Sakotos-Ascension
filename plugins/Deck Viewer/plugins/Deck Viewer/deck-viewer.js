@@ -1036,6 +1036,7 @@
     clearGalleryTagFilter: () => clearGalleryTagFilter,
     fetchGalleriesByTags: () => fetchGalleriesByTags,
     fetchGalleryImagePreviews: () => fetchGalleryImagePreviews,
+    fetchGalleryImages: () => fetchGalleryImages,
     fetchGalleryMetadata: () => fetchGalleryMetadata,
     fetchImageMetadata: () => fetchImageMetadata2,
     searchPerformers: () => searchPerformers,
@@ -1136,6 +1137,51 @@
       return images.filter((img) => img.id !== coverId).map((img) => img?.paths?.thumbnail || img?.paths?.image || `/images/${img.id}`).filter(Boolean).slice(0, count);
     } catch (error) {
       return handleError("fetchGalleryImagePreviews", error, []);
+    }
+  }
+  async function fetchGalleryImages(galleryId, page = 1, perPage = 1e3) {
+    const query = `query FindGalleryImages($filter: FindFilterType!, $image_filter: ImageFilterType) {
+    findImages(filter: $filter, image_filter: $image_filter) {
+      count
+      images {
+        id
+        title
+        paths {
+          thumbnail
+          image
+        }
+        performers {
+          id
+          name
+        }
+      }
+    }
+  }`;
+    const variables = {
+      filter: {
+        per_page: perPage,
+        page,
+        sort: "path",
+        direction: "ASC"
+      },
+      image_filter: {
+        galleries: {
+          modifier: "INCLUDES",
+          value: [galleryId]
+        }
+      }
+    };
+    try {
+      const response = await fetch("/graphql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, variables })
+      });
+      const data = await response.json();
+      return data?.data?.findImages || { count: 0, images: [] };
+    } catch (error) {
+      console.error("[Image Deck] Error fetching gallery images:", error);
+      return { count: 0, images: [] };
     }
   }
   async function safeFetch(url, options, operationName = "") {
@@ -1545,6 +1591,94 @@
   function setCurrentSwiper(swiper) {
     currentSwiperRef = swiper;
   }
+  async function safeGraphqlMutation(operationName, query, variables) {
+    try {
+      const response = await fetch("/graphql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, variables })
+      });
+      const data = await response.json();
+      if (data?.errors) {
+        const msg = data.errors.map((e) => e.message).join("; ");
+        throw new Error(`${operationName} failed: ${msg}`);
+      }
+      return data?.data || true;
+    } catch (error) {
+      console.error(`[Image Deck] ${operationName} error:`, error);
+      throw error;
+    }
+  }
+  async function deleteImage(imageId) {
+    const mutation = `mutation ImagesDestroy($input: ImagesDestroyInput!) {
+    imagesDestroy(input: $input)
+  }`;
+    return safeGraphqlMutation("deleteImage", mutation, {
+      input: {
+        ids: [imageId],
+        delete_file: false,
+        delete_generated: false,
+        destroy_file_entry: false
+      }
+    });
+  }
+  async function deleteGallery(galleryId) {
+    const mutation = `mutation GalleryDestroy($input: GalleryDestroyInput!) {
+    galleryDestroy(input: $input)
+  }`;
+    return safeGraphqlMutation("deleteGallery", mutation, {
+      input: {
+        ids: [galleryId],
+        delete_file: false,
+        delete_generated: false,
+        destroy_file_entry: false
+      }
+    });
+  }
+  async function setGalleryCover(galleryId, imageId) {
+    const mutation = `mutation SetGalleryCover($input: GallerySetCoverInput!) {
+    setGalleryCover(input: $input)
+  }`;
+    return safeGraphqlMutation("setGalleryCover", mutation, {
+      input: {
+        gallery_id: galleryId,
+        cover_image_id: imageId
+      }
+    });
+  }
+  function getCurrentGalleryId(metadata) {
+    if (window.currentContextInfo?.galleryId) {
+      return window.currentContextInfo.galleryId;
+    }
+    const urlMatch = window.location.pathname.match(/\/galleries\/(\d+)/);
+    if (urlMatch) return urlMatch[1];
+    if (metadata?.galleries?.length > 0) {
+      return metadata.galleries[0].id;
+    }
+    return null;
+  }
+  function removeCurrentItemFromDeck(targetIndex = null) {
+    if (!currentSwiperRef) return;
+    const currentIndex = currentSwiperRef.activeIndex;
+    const currentImage = window.currentImages?.[currentIndex];
+    if (!currentImage) return;
+    window.currentImages.splice(currentIndex, 1);
+    if (typeof state !== "undefined" && state?.getImages && state?.setImages) {
+      const stateImages = state.getImages() || [];
+      const stateIndex = stateImages.findIndex((img) => img?.id === currentImage.id);
+      if (stateIndex !== -1) stateImages.splice(stateIndex, 1);
+      state.setImages(stateImages);
+    }
+    const newCount = window.currentImages.length;
+    if (newCount === 0) {
+      closeMetadataModal();
+      const closeBtn = document.querySelector(".image-deck-close");
+      if (closeBtn) closeBtn.click();
+      return;
+    }
+    const newIndex = targetIndex !== null ? Math.max(0, Math.min(targetIndex, newCount - 1)) : Math.min(currentIndex, newCount - 1);
+    window.dispatchEvent(new CustomEvent("updateDeckContent", { detail: { targetIndex: newIndex } }));
+  }
   async function openMetadataModal() {
     if (!currentSwiperRef) return;
     const currentIndex = currentSwiperRef.activeIndex;
@@ -1562,9 +1696,7 @@
       let galleryId = currentImage.id;
       if (currentImage.url) {
         const urlMatch = currentImage.url.match(/\/galleries\/(\d+)/);
-        if (urlMatch) {
-          galleryId = urlMatch[1];
-        }
+        if (urlMatch) galleryId = urlMatch[1];
       }
       currentMetadata = await fetchGalleryMetadata(galleryId);
     } else {
@@ -1591,101 +1723,145 @@
       viewUrl = metadata.url;
     }
     body.innerHTML = `
-        <div class="metadata-section metadata-file-info">
-            <div class="metadata-filename" title="${metadata.title || "Untitled"}">${metadata.title || "Untitled"}</div>
-            <a href="${viewUrl}" target="_blank" class="metadata-link" title="Open gallery page in new tab">
-                View in Stash \u2192
-            </a>
-        </div>
+    <div class="metadata-section metadata-file-info">
+      <div class="metadata-filename" title="${metadata.title || "Untitled"}">${metadata.title || "Untitled"}</div>
+      <a href="${viewUrl}" target="_blank" class="metadata-link" title="Open gallery page in new tab">
+        View in Stash \u2192
+      </a>
+    </div>
 
-        <div class="metadata-section">
-            <label>Title</label>
-            <input type="text" class="metadata-title" value="${metadata.title || ""}" placeholder="Enter title...">
-        </div>
+    <div class="metadata-section">
+      <label>Title</label>
+      <input type="text" class="metadata-title" value="${metadata.title || ""}" placeholder="Enter title...">
+    </div>
 
-        <div class="metadata-section">
-            <label>Details</label>
-            <textarea class="metadata-details" placeholder="Enter details...">${metadata.details || ""}</textarea>
-        </div>
+    <div class="metadata-section">
+      <label>Details</label>
+      <textarea class="metadata-details" placeholder="Enter details...">${metadata.details || ""}</textarea>
+    </div>
 
-        <!-- STUDIO SECTION -->
-        <div class="metadata-section">
-            <label>Studio</label>
-            <div class="metadata-tags metadata-studio">
-                ${metadata.studio ? `
-                    <span class="metadata-tag" data-studio-id="${metadata.studio.id}">
-                        ${metadata.studio.name}
-                        <button class="metadata-tag-remove" data-studio-id="${metadata.studio.id}">\xD7</button>
-                    </span>
-                ` : ""}
-            </div>
-            <input type="text" class="metadata-tag-search metadata-studio-search" placeholder="Search studios...">
-            <div class="metadata-tag-results metadata-studio-results"></div>
-        </div>
+    <div class="metadata-section">
+      <label>Studio</label>
+      <div class="metadata-tags metadata-studio">
+        ${metadata.studio ? `
+          <span class="metadata-tag" data-studio-id="${metadata.studio.id}">
+            ${metadata.studio.name}
+            <button class="metadata-tag-remove" data-studio-id="${metadata.studio.id}">\xD7</button>
+          </span>
+        ` : ""}
+      </div>
+      <input type="text" class="metadata-tag-search metadata-studio-search" placeholder="Search studios...">
+      <div class="metadata-tag-results metadata-studio-results"></div>
+    </div>
 
-        <!-- PERFORMERS SECTION -->
-        <div class="metadata-section">
-            <label>Performers</label>
-            <div class="metadata-tags metadata-performers">
-                ${metadata.performers ? metadata.performers.map(
+    <div class="metadata-section">
+      <label>Performers</label>
+      <div class="metadata-tags metadata-performers">
+        ${metadata.performers ? metadata.performers.map(
       (performer) => `<span class="metadata-tag" data-performer-id="${performer.id}">
-                        ${performer.name}
-                        <button class="metadata-tag-remove" data-performer-id="${performer.id}">\xD7</button>
-                    </span>`
+            ${performer.name}
+            <button class="metadata-tag-remove" data-performer-id="${performer.id}">\xD7</button>
+          </span>`
     ).join("") : ""}
-            </div>
-            <input type="text" class="metadata-tag-search metadata-performer-search" placeholder="Search performers...">
-            <div class="metadata-tag-results metadata-performer-results"></div>
-        </div>
+      </div>
+      <input type="text" class="metadata-tag-search metadata-performer-search" placeholder="Search performers...">
+      <div class="metadata-tag-results metadata-performer-results"></div>
+    </div>
 
-        <!-- TAGGER SECTION -->
-        <div class="metadata-section">
-            <label>Tags</label>
-            <div class="metadata-tags">
-                ${metadata.tags ? metadata.tags.map(
+    <div class="metadata-section">
+      <label>Tags</label>
+      <div class="metadata-tags">
+        ${metadata.tags ? metadata.tags.map(
       (tag) => `<span class="metadata-tag" data-tag-id="${tag.id}">
-                        ${tag.name}
-                        <button class="metadata-tag-remove" data-tag-id="${tag.id}">\xD7</button>
-                    </span>`
+            ${tag.name}
+            <button class="metadata-tag-remove" data-tag-id="${tag.id}">\xD7</button>
+          </span>`
     ).join("") : ""}
-            </div>
-            <input type="text" class="metadata-tag-search" placeholder="Search tags...">
-            <div class="metadata-tag-results"></div>
-        </div>
+      </div>
+      <input type="text" class="metadata-tag-search" placeholder="Search tags...">
+      <div class="metadata-tag-results"></div>
+    </div>
 
-        <div class="metadata-section">
-            <label>Info</label>
-            <div class="metadata-info">
-                ${metadata.date ? `<div><strong>Date:</strong> ${metadata.date}</div>` : ""}
-                ${metadata.image_count !== void 0 ? `<div><strong>Image Count:</strong> ${metadata.image_count}</div>` : ""}
-                <div><strong>Created:</strong> ${metadata.created_at || "Unknown"}</div>
-                <div><strong>Updated:</strong> ${metadata.updated_at || "Unknown"}</div>
-                ${metadata.rating100 ? `<div><strong>Rating:</strong> ${metadata.rating100}/100</div>` : ""}
-                <div><strong>Organized:</strong> ${metadata.organized ? "Yes" : "No"}</div>
-            </div>
-        </div>
+    <div class="metadata-section">
+      <label>Info</label>
+      <div class="metadata-info">
+        ${metadata.date ? `<div><strong>Date:</strong> ${metadata.date}</div>` : ""}
+        ${metadata.image_count !== void 0 ? `<div><strong>Image Count:</strong> ${metadata.image_count}</div>` : ""}
+        <div><strong>Created:</strong> ${metadata.created_at || "Unknown"}</div>
+        <div><strong>Updated:</strong> ${metadata.updated_at || "Unknown"}</div>
+        ${metadata.rating100 ? `<div><strong>Rating:</strong> ${metadata.rating100}/100</div>` : ""}
+        <div><strong>Organized:</strong> ${metadata.organized ? "Yes" : "No"}</div>
+      </div>
+    </div>
 
-        ${metadata.urls && metadata.urls.length > 0 ? `
-        <div class="metadata-section">
-            <label>URLs</label>
-            <div class="metadata-urls">
-                ${metadata.urls.map(
+    ${metadata.urls && metadata.urls.length > 0 ? `
+      <div class="metadata-section">
+        <label>URLs</label>
+        <div class="metadata-urls">
+          ${metadata.urls.map(
       (url) => `<div><a href="${url}" target="_blank">${url}</a></div>`
     ).join("")}
-            </div>
-        </div>` : ""}
-
-        <div class="metadata-actions">
-            <button class="metadata-save-btn">Save Changes</button>
         </div>
-    `;
+      </div>
+    ` : ""}
+
+    <div class="metadata-actions">
+      <button class="metadata-save-btn">Save Changes</button>
+      <button class="metadata-organized-btn ${metadata.organized ? "active" : ""}" type="button">
+        ${metadata.organized ? "Organized \u2713" : "Mark Organized"}
+      </button>
+      <button class="metadata-delete-btn btn btn-danger" type="button">Delete</button>
+    </div>
+  `;
     setupGalleryMetadataHandlers(metadata);
   }
   function setupGalleryMetadataHandlers(metadata) {
     const body = document.querySelector(".image-deck-metadata-body");
     if (!body) return;
     const saveBtn = body.querySelector(".metadata-save-btn");
-    if (!saveBtn) return;
+    const organizedBtn = body.querySelector(".metadata-organized-btn");
+    const deleteBtn = body.querySelector(".metadata-delete-btn");
+    if (!saveBtn || !deleteBtn) return;
+    deleteBtn.addEventListener("click", async () => {
+      const confirmed = confirm(`Delete gallery "${metadata.title || "Untitled"}"?`);
+      if (!confirmed) return;
+      deleteBtn.textContent = "Deleting...";
+      deleteBtn.disabled = true;
+      try {
+        await deleteGallery(metadata.id);
+        const currentIndex = currentSwiperRef?.activeIndex || 0;
+        const prevIndex = Math.max(0, currentIndex - 1);
+        removeCurrentItemFromDeck(prevIndex);
+        closeMetadataModal();
+      } catch (error) {
+        deleteBtn.textContent = "Error";
+        console.error("[Image Deck] Delete gallery failed:", error);
+        setTimeout(() => {
+          deleteBtn.textContent = "Delete";
+          deleteBtn.disabled = false;
+        }, 2e3);
+      }
+    });
+    organizedBtn.addEventListener("click", async () => {
+      const isOrganized = organizedBtn.classList.contains("active");
+      const newOrganized = !isOrganized;
+      organizedBtn.textContent = "Saving...";
+      organizedBtn.disabled = true;
+      try {
+        await updateGalleryMetadata(metadata.id, { organized: newOrganized });
+        organizedBtn.classList.toggle("active", newOrganized);
+        organizedBtn.textContent = newOrganized ? "Organized \u2713" : "Mark Organized";
+      } catch (error) {
+        console.error("[Image Deck] Error updating gallery organized state:", error);
+        organizedBtn.textContent = "Error";
+        setTimeout(() => {
+          organizedBtn.textContent = isOrganized ? "Organized \u2713" : "Mark Organized";
+          organizedBtn.disabled = false;
+        }, 2e3);
+      } finally {
+        organizedBtn.disabled = false;
+      }
+    });
     const originalTagIds = metadata.tags ? metadata.tags.map((tag) => tag.id) : [];
     const originalPerformerIds = metadata.performers ? metadata.performers.map((performer) => performer.id) : [];
     const originalStudioId = metadata.studio ? metadata.studio.id : null;
@@ -1708,8 +1884,8 @@
           const studios = await searchStudios2(query);
           studioResults.innerHTML = studios.map(
             (studio) => `<div class="metadata-tag-result" data-studio-id="${studio.id}" data-studio-name="${studio.name}">
-                        ${studio.name}
-                    </div>`
+            ${studio.name}
+          </div>`
           ).join("");
           studioResults.querySelectorAll(".metadata-tag-result").forEach((result) => {
             result.addEventListener("click", (e2) => {
@@ -1718,9 +1894,9 @@
               const studioContainer = body.querySelector(".metadata-studio");
               studioContainer.innerHTML = "";
               const studioHtml = `<span class="metadata-tag" data-studio-id="${studioId}">
-                            ${studioName}
-                            <button class="metadata-tag-remove" data-studio-id="${studioId}">\xD7</button>
-                        </span>`;
+              ${studioName}
+              <button class="metadata-tag-remove" data-studio-id="${studioId}">\xD7</button>
+            </span>`;
               studioContainer.insertAdjacentHTML("beforeend", studioHtml);
               currentStudioId = studioId;
               const newStudio = studioContainer.lastElementChild;
@@ -1760,21 +1936,19 @@
           const performers = await searchPerformers3(query);
           performerResults.innerHTML = performers.map(
             (performer) => `<div class="metadata-tag-result" data-performer-id="${performer.id}" data-performer-name="${performer.name}">
-                        ${performer.name}
-                    </div>`
+            ${performer.name}
+          </div>`
           ).join("");
           performerResults.querySelectorAll(".metadata-tag-result").forEach((result) => {
             result.addEventListener("click", (e2) => {
               const performerId = e2.target.dataset.performerId;
               const performerName = e2.target.dataset.performerName;
-              if (currentPerformerIds.includes(performerId)) {
-                return;
-              }
+              if (currentPerformerIds.includes(performerId)) return;
               const performersContainer = body.querySelector(".metadata-performers");
               const performerHtml = `<span class="metadata-tag" data-performer-id="${performerId}">
-                            ${performerName}
-                            <button class="metadata-tag-remove" data-performer-id="${performerId}">\xD7</button>
-                        </span>`;
+              ${performerName}
+              <button class="metadata-tag-remove" data-performer-id="${performerId}">\xD7</button>
+            </span>`;
               performersContainer.insertAdjacentHTML("beforeend", performerHtml);
               currentPerformerIds.push(performerId);
               const newPerformer = performersContainer.lastElementChild;
@@ -1816,21 +1990,19 @@
           const tags = await searchTags3(query);
           tagResults.innerHTML = tags.map(
             (tag) => `<div class="metadata-tag-result" data-tag-id="${tag.id}" data-tag-name="${tag.name}">
-                        ${tag.name}
-                    </div>`
+            ${tag.name}
+          </div>`
           ).join("");
           tagResults.querySelectorAll(".metadata-tag-result").forEach((result) => {
             result.addEventListener("click", (e2) => {
               const tagId = e2.target.dataset.tagId;
               const tagName = e2.target.dataset.tagName;
-              if (currentTagIds.includes(tagId)) {
-                return;
-              }
+              if (currentTagIds.includes(tagId)) return;
               const tagsContainer = body.querySelector(".metadata-tags:not(.metadata-performers):not(.metadata-studio)");
               const tagHtml = `<span class="metadata-tag" data-tag-id="${tagId}">
-                            ${tagName}
-                            <button class="metadata-tag-remove" data-tag-id="${tagId}">\xD7</button>
-                        </span>`;
+              ${tagName}
+              <button class="metadata-tag-remove" data-tag-id="${tagId}">\xD7</button>
+            </span>`;
               tagsContainer.insertAdjacentHTML("beforeend", tagHtml);
               currentTagIds.push(tagId);
               const newTag = tagsContainer.lastElementChild;
@@ -1882,9 +2054,7 @@
         }
         saveBtn.textContent = "Saved \u2713";
         const filenameEl = body.querySelector(".metadata-filename");
-        if (filenameEl) {
-          filenameEl.textContent = title || "Untitled";
-        }
+        if (filenameEl) filenameEl.textContent = title || "Untitled";
         setTimeout(() => {
           saveBtn.textContent = "Save Changes";
           saveBtn.disabled = false;
@@ -1902,19 +2072,16 @@
   async function updateGalleryTagsSeparately(galleryId, tagIds) {
     try {
       const mutation = `mutation GalleryUpdate($input: GalleryUpdateInput!) {
-            galleryUpdate(input: $input) {
-                id
-                title
-                tags {
-                    id
-                    name
-                }
-            }
-        }`;
-      const input = {
-        id: galleryId,
-        tag_ids: tagIds
-      };
+      galleryUpdate(input: $input) {
+        id
+        title
+        tags {
+          id
+          name
+        }
+      }
+    }`;
+      const input = { id: galleryId, tag_ids: tagIds };
       const response = await fetch("/graphql", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1943,69 +2110,100 @@
     if (!body) return;
     const rating = metadata.rating100 ? metadata.rating100 / 20 : 0;
     const filename = metadata.files && metadata.files.length > 0 ? metadata.files[0].basename : "Unknown";
+    const coverGalleryId = getCurrentGalleryId(metadata);
     body.innerHTML = `
-        <div class="metadata-section metadata-file-info">
-            <div class="metadata-filename" title="${filename}">${filename}</div>
-            <a href="/images/${metadata.id}" target="_blank" class="metadata-link" title="Open image page in new tab">
-                View in Stash \u2192
-            </a>
-        </div>
+    <div class="metadata-section metadata-file-info">
+      <div class="metadata-filename" title="${filename}">${filename}</div>
+      <a href="/images/${metadata.id}" target="_blank" class="metadata-link" title="Open image page in new tab">
+        View in Stash \u2192
+      </a>
+    </div>
 
-        <div class="metadata-section">
-            <label>Rating</label>
-            <div class="metadata-rating">
-                ${[1, 2, 3, 4, 5].map(
+    <div class="metadata-section">
+      <label>Rating</label>
+      <div class="metadata-rating">
+        ${[1, 2, 3, 4, 5].map(
       (star) => `<button class="metadata-star ${star <= rating ? "active" : ""}" data-rating="${star}">\u2605</button>`
     ).join("")}
-            </div>
-        </div>
+      </div>
+    </div>
 
-        <div class="metadata-section">
-            <label>Title</label>
-            <input type="text" class="metadata-title" value="${metadata.title || ""}" placeholder="Enter title...">
-        </div>
+    <div class="metadata-section">
+      <label>Title</label>
+      <input type="text" class="metadata-title" value="${metadata.title || ""}" placeholder="Enter title...">
+    </div>
 
-        <div class="metadata-section">
-            <label>Details</label>
-            <textarea class="metadata-details" placeholder="Enter details...">${metadata.details || ""}</textarea>
-        </div>
+    <div class="metadata-section">
+      <label>Details</label>
+      <textarea class="metadata-details" placeholder="Enter details...">${metadata.details || ""}</textarea>
+    </div>
 
-        <div class="metadata-section">
-            <label>Tags</label>
-            <div class="metadata-tags">
-                ${metadata.tags.map(
+    <div class="metadata-section">
+      <label>Tags</label>
+      <div class="metadata-tags">
+        ${metadata.tags.map(
       (tag) => `<span class="metadata-tag" data-tag-id="${tag.id}">
-                        ${tag.name}
-                        <button class="metadata-tag-remove" data-tag-id="${tag.id}">\xD7</button>
-                    </span>`
+            ${tag.name}
+            <button class="metadata-tag-remove" data-tag-id="${tag.id}">\xD7</button>
+          </span>`
     ).join("")}
-            </div>
-            <input type="text" class="metadata-tag-search" placeholder="Search tags...">
-            <div class="metadata-tag-results"></div>
-        </div>
+      </div>
+      <input type="text" class="metadata-tag-search" placeholder="Search tags...">
+      <div class="metadata-tag-results"></div>
+    </div>
 
-        <div class="metadata-section">
-            <label>Info</label>
-            <div class="metadata-info">
-                ${metadata.performers.length > 0 ? `<div><strong>Performers:</strong> ${metadata.performers.map((p) => p.name).join(", ")}</div>` : ""}
-                ${metadata.studio ? `<div><strong>Studio:</strong> ${metadata.studio.name}</div>` : ""}
-                ${metadata.date ? `<div><strong>Date:</strong> ${metadata.date}</div>` : ""}
-                ${metadata.photographer ? `<div><strong>Photographer:</strong> ${metadata.photographer}</div>` : ""}
-                <div><strong>Views:</strong> ${metadata.o_counter || 0}</div>
-            </div>
-        </div>
+    <div class="metadata-section">
+      <label>Info</label>
+      <div class="metadata-info">
+        ${metadata.performers.length > 0 ? `<div><strong>Performers:</strong> ${metadata.performers.map((p) => p.name).join(", ")}</div>` : ""}
+        ${metadata.studio ? `<div><strong>Studio:</strong> ${metadata.studio.name}</div>` : ""}
+        ${metadata.date ? `<div><strong>Date:</strong> ${metadata.date}</div>` : ""}
+        ${metadata.photographer ? `<div><strong>Photographer:</strong> ${metadata.photographer}</div>` : ""}
+        <div><strong>Views:</strong> ${metadata.o_counter || 0}</div>
+      </div>
+    </div>
 
-        <div class="metadata-actions">
-            <button class="metadata-save-btn">Save Changes</button>
-            <button class="metadata-organized-btn ${metadata.organized ? "active" : ""}">
-                ${metadata.organized ? "Organized \u2713" : "Mark Organized"}
-            </button>
-        </div>
-    `;
+    <div class="metadata-actions">
+      <button class="metadata-save-btn">Save Changes</button>
+      <button class="metadata-organized-btn ${metadata.organized ? "active" : ""}" type="button">
+        ${metadata.organized ? "Organized \u2713" : "Mark Organized"}
+      </button>
+      <button class="metadata-set-cover-btn" type="button" ${coverGalleryId ? "" : "disabled"}>
+        Set as Gallery Cover
+      </button>
+      <button class="metadata-delete-btn btn btn-danger" type="button">Delete</button>
+    </div>
+  `;
     setupMetadataHandlers(metadata);
   }
   function setupMetadataHandlers(metadata) {
     const body = document.querySelector(".image-deck-metadata-body");
+    if (!body) return;
+    const setCoverBtn = body.querySelector(".metadata-set-cover-btn");
+    if (setCoverBtn) {
+      const galleryId = getCurrentGalleryId(metadata);
+      if (!galleryId) setCoverBtn.disabled = true;
+      setCoverBtn.addEventListener("click", async () => {
+        if (!galleryId) return;
+        setCoverBtn.textContent = "Setting...";
+        setCoverBtn.disabled = true;
+        try {
+          await setGalleryCover(galleryId, metadata.id);
+          setCoverBtn.textContent = "Cover Set \u2713";
+          setTimeout(() => {
+            setCoverBtn.textContent = "Set as Gallery Cover";
+            setCoverBtn.disabled = false;
+          }, 2e3);
+        } catch (error) {
+          console.error("[Image Deck] Set gallery cover failed:", error);
+          setCoverBtn.textContent = "Error";
+          setTimeout(() => {
+            setCoverBtn.textContent = "Set as Gallery Cover";
+            setCoverBtn.disabled = false;
+          }, 2e3);
+        }
+      });
+    }
     body.querySelectorAll(".metadata-star").forEach((star) => {
       star.addEventListener("click", (e) => {
         const rating = parseInt(e.target.dataset.rating);
@@ -2035,8 +2233,8 @@
         const tags = await searchTags(query);
         tagResults.innerHTML = tags.map(
           (tag) => `<div class="metadata-tag-result" data-tag-id="${tag.id}" data-tag-name="${tag.name}">
-                    ${tag.name}
-                </div>`
+          ${tag.name}
+        </div>`
         ).join("");
         tagResults.querySelectorAll(".metadata-tag-result").forEach((result) => {
           result.addEventListener("click", (e2) => {
@@ -2044,9 +2242,9 @@
             const tagName = e2.target.dataset.tagName;
             const tagsContainer = body.querySelector(".metadata-tags");
             const tagHtml = `<span class="metadata-tag" data-tag-id="${tagId}">
-                        ${tagName}
-                        <button class="metadata-tag-remove" data-tag-id="${tagId}">\xD7</button>
-                    </span>`;
+            ${tagName}
+            <button class="metadata-tag-remove" data-tag-id="${tagId}">\xD7</button>
+          </span>`;
             tagsContainer.insertAdjacentHTML("beforeend", tagHtml);
             const newTag = tagsContainer.lastElementChild;
             newTag.querySelector(".metadata-tag-remove").addEventListener("click", (e3) => {
@@ -2081,9 +2279,42 @@
     organizedBtn.addEventListener("click", async () => {
       const isOrganized = organizedBtn.classList.contains("active");
       const newOrganized = !isOrganized;
-      await updateImageMetadata(metadata.id, { organized: newOrganized });
-      organizedBtn.classList.toggle("active", newOrganized);
-      organizedBtn.textContent = newOrganized ? "Organized \u2713" : "Mark Organized";
+      organizedBtn.textContent = "Saving...";
+      organizedBtn.disabled = true;
+      try {
+        await updateImageMetadata(metadata.id, { organized: newOrganized });
+        organizedBtn.classList.toggle("active", newOrganized);
+        organizedBtn.textContent = newOrganized ? "Organized \u2713" : "Mark Organized";
+      } catch (error) {
+        console.error("[Image Deck] Error updating organized state:", error);
+        organizedBtn.textContent = "Error";
+        setTimeout(() => {
+          organizedBtn.textContent = isOrganized ? "Organized \u2713" : "Mark Organized";
+          organizedBtn.disabled = false;
+        }, 2e3);
+      } finally {
+        organizedBtn.disabled = false;
+      }
+    });
+    const deleteBtn = body.querySelector(".metadata-delete-btn");
+    deleteBtn.addEventListener("click", async () => {
+      const filename = metadata.files?.[0]?.basename || metadata.title || "this image";
+      const confirmed = confirm(`Delete image "${filename}"?`);
+      if (!confirmed) return;
+      deleteBtn.textContent = "Deleting...";
+      deleteBtn.disabled = true;
+      try {
+        await deleteImage(metadata.id);
+        removeCurrentItemFromDeck();
+        closeMetadataModal();
+      } catch (error) {
+        deleteBtn.textContent = "Error";
+        console.error("[Image Deck] Delete image failed:", error);
+        setTimeout(() => {
+          deleteBtn.textContent = "Delete";
+          deleteBtn.disabled = false;
+        }, 2e3);
+      }
     });
   }
   var currentMetadata, currentSwiperRef;
@@ -2104,7 +2335,7 @@
   });
 
   // state.js
-  var ImageDeckState, state;
+  var ImageDeckState, state2;
   var init_state = __esm({
     "state.js"() {
       ImageDeckState = class {
@@ -2181,7 +2412,7 @@
           }
         }
       };
-      state = new ImageDeckState();
+      state2 = new ImageDeckState();
     }
   });
 
@@ -2296,20 +2527,20 @@
       fillGalleryPreviewsForSlide(container, galleryId);
     }, true);
   }
-  function initSwiper(container, images, pluginConfig2, updateUICallback, savePositionCallback, contextInfo2) {
+  function initSwiper(container, images, pluginConfig2, updateUICallback, savePositionCallback, contextInfo2, startAt = 0) {
     const swiperEl = container.querySelector(".swiper");
     if (!swiperEl || swiperEl.swiper) return swiperEl?.swiper;
     const isLooped = false;
     const effectOptions = getEffectOptions(pluginConfig2.transitionEffect, pluginConfig2);
+    const safeInitialSlide = Math.max(0, Math.min(startAt, images.length - 1));
     const swiperConfig = {
       effect: pluginConfig2.transitionEffect,
       centeredSlides: true,
       slidesPerView: 1,
       slidesPerGroup: 1,
-      initialSlide: 0,
-      keyboard: {
-        enabled: false
-      },
+      initialSlide: safeInitialSlide,
+      // was hard-coded to 0
+      keyboard: { enabled: false },
       mousewheel: false,
       zoom: {
         maxRatio: 3,
@@ -2351,9 +2582,7 @@
       on: {
         click(s, event) {
           const interactiveElements = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"];
-          if (interactiveElements.includes(event.target.tagName)) {
-            return;
-          }
+          if (interactiveElements.includes(event.target.tagName)) return;
         },
         slideChange() {
           updateUICallback?.(container);
@@ -2363,9 +2592,7 @@
           const total = this.virtual?.slides?.length || this.slides.length;
           if (total > 0 && this.activeIndex >= total - 3) {
             const nextBtn = document.querySelector('[data-action="next-chunk"]');
-            if (nextBtn && !nextBtn.disabled) {
-              nextBtn.click();
-            }
+            if (nextBtn && !nextBtn.disabled) nextBtn.click();
           }
           triggerPreviewFill(container);
         },
@@ -2384,8 +2611,8 @@
       }
     };
     const swiper = new Swiper(swiperEl, swiperConfig);
-    state.setSwiper(swiper);
-    state.setImages(images);
+    state2.setSwiper(swiper);
+    state2.setImages(images);
     const loader = container.querySelector(".image-deck-loading");
     if (loader) loader.style.display = "none";
     attachHoverFill(container);
@@ -2484,12 +2711,15 @@
     div.textContent = text;
     return div.innerHTML;
   }
+  function setSidebarContextInfo(ctx) {
+    currentContextInfo = ctx;
+  }
   async function searchTags2(query, limit = 20) {
     if (!query) return [];
     try {
       const q = `query SearchTags($filter: FindFilterType) {
-            findTags(filter: $filter) { tags { id name } }
-        }`;
+      findTags(filter: $filter) { tags { id name } }
+    }`;
       const res = await fetch("/graphql", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2506,8 +2736,8 @@
     if (!query) return [];
     try {
       const q = `query SearchPerformers($filter: FindFilterType) {
-            findPerformers(filter: $filter) { performers { id name } }
-        }`;
+      findPerformers(filter: $filter) { performers { id name } }
+    }`;
       const res = await fetch("/graphql", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2520,13 +2750,47 @@
       return [];
     }
   }
+  async function searchGalleries(query, limit = 20) {
+    if (!query) return [];
+    try {
+      const q = `query SearchGalleries($filter: FindFilterType) {
+      findGalleries(filter: $filter) {
+        galleries {
+          id
+          title
+          image_count
+          cover {
+            paths {
+              thumbnail
+              image
+            }
+          }
+          performers {
+            id
+            name
+          }
+        }
+      }
+    }`;
+      const res = await fetch("/graphql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q, variables: { filter: { q: query, per_page: limit } } })
+      });
+      const data = await res.json();
+      return data?.data?.findGalleries?.galleries || [];
+    } catch (e) {
+      console.error("[Image Deck] Error searching galleries:", e);
+      return [];
+    }
+  }
   async function getTagNames(tagIds) {
     if (!tagIds || tagIds.length === 0) return {};
     try {
       const tagResults = await Promise.all(tagIds.map(async (tagId) => {
         const query = `query FindTag($id: ID!) {
-                findTag(id: $id) { id name }
-            }`;
+        findTag(id: $id) { id name }
+      }`;
         const response = await fetch("/graphql", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2550,8 +2814,8 @@
     try {
       const performerResults = await Promise.all(performerIds.map(async (performerId) => {
         const query = `query FindPerformer($id: ID!) {
-                findPerformer(id: $id) { id name }
-            }`;
+        findPerformer(id: $id) { id name }
+      }`;
         const response = await fetch("/graphql", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2604,14 +2868,14 @@
   async function fetchSavedFilters(mode) {
     if (!mode) return [];
     const query = `query FindSavedFilters($mode: FilterMode!) {
-        findSavedFilters(mode: $mode) {
-            id
-            name
-            mode
-            find_filter { q page per_page sort direction }
-            object_filter
-        }
-    }`;
+    findSavedFilters(mode: $mode) {
+      id
+      name
+      mode
+      find_filter { q page per_page sort direction }
+      object_filter
+    }
+  }`;
     try {
       const res = await fetch("/graphql", {
         method: "POST",
@@ -2755,6 +3019,28 @@
       }
     }
   }
+  function mergeFilters(current, pending) {
+    const merged = {
+      includedTags: [.../* @__PURE__ */ new Set([...current.includedTags || [], ...pending.includedTags || []])],
+      excludedTags: [.../* @__PURE__ */ new Set([...current.excludedTags || [], ...pending.excludedTags || []])],
+      includedPerformers: [.../* @__PURE__ */ new Set([...current.includedPerformers || [], ...pending.includedPerformers || []])],
+      excludedPerformers: [.../* @__PURE__ */ new Set([...current.excludedPerformers || [], ...pending.excludedPerformers || []])]
+    };
+    merged.includedTags = merged.includedTags.filter((id) => !merged.excludedTags.includes(id));
+    merged.excludedTags = merged.excludedTags.filter((id) => !merged.includedTags.includes(id));
+    merged.includedPerformers = merged.includedPerformers.filter((id) => !merged.excludedPerformers.includes(id));
+    merged.excludedPerformers = merged.excludedPerformers.filter((id) => !merged.includedPerformers.includes(id));
+    return merged;
+  }
+  function updateFilterButtons(container) {
+    const applyBtn = container.querySelector(".sidebar-apply-btn");
+    const clearBtn = container.querySelector(".sidebar-clear-btn");
+    const hasPending = sidebarPendingFilters.includedTags.length > 0 || sidebarPendingFilters.excludedTags.length > 0 || sidebarPendingFilters.includedPerformers.length > 0 || sidebarPendingFilters.excludedPerformers.length > 0;
+    const current = getCurrentFilterTags();
+    const hasApplied = current.includedTags.length > 0 || current.excludedTags.length > 0 || current.includedPerformers.length > 0 || current.excludedPerformers.length > 0 || currentContextInfo?.type === "galleries" && !!currentContextInfo?.filter?.q || currentContextInfo?.type === "galleries" && !!currentContextInfo?.filter?.id;
+    applyBtn?.classList.toggle("pending", hasPending);
+    clearBtn?.classList.toggle("active", hasPending || hasApplied);
+  }
   async function renderPendingFilters(container) {
     const target = container.querySelector(".sidebar-pending-filters");
     if (!target) return;
@@ -2770,11 +3056,12 @@
     excludedPerformers.forEach((id) => pills.push({ id, type: "performer", mode: "excluded", name: performerNames[id] || `Performer:${id}` }));
     if (!pills.length) {
       target.innerHTML = '<div class="sidebar-empty-state">No filters selected</div>';
-      return;
+    } else {
+      target.innerHTML = pills.map(
+        (p) => `<span class="sidebar-filter-pill ${p.mode === "included" ? "include" : "exclude"}" data-id="${p.id}" data-type="${p.type}" data-mode="${p.mode}">${p.mode === "included" ? "\u2705" : "\u274C"} ${escapeHtml(p.name)}<button class="remove-pill" type="button">\xD7</button></span>`
+      ).join("");
     }
-    target.innerHTML = pills.map(
-      (p) => `<span class="sidebar-filter-pill ${p.mode === "included" ? "include" : "exclude"}" data-id="${p.id}" data-type="${p.type}" data-mode="${p.mode}">${p.mode === "included" ? "\u2705" : "\u274C"} ${escapeHtml(p.name)}<button class="remove-pill" type="button">\xD7</button></span>`
-    ).join("");
+    updateFilterButtons(container);
   }
   async function renderSavedFilterDropdown(container, contextInfo2, onSavedFilterChange) {
     const select = container.querySelector(".sidebar-saved-filter-select");
@@ -2828,6 +3115,7 @@
     const excludedPerformers = current.excludedPerformers || [];
     if (!includedTags.length && !excludedTags.length && !includedPerformers.length && !excludedPerformers.length) {
       target.innerHTML = '<div class="sidebar-empty-state">No filters applied</div>';
+      updateFilterButtons(container);
       return;
     }
     const [tagNames, performerNames] = await Promise.all([
@@ -2886,15 +3174,17 @@
         await renderActiveFilters(container, callbacks);
       });
     });
+    updateFilterButtons(container);
   }
   async function updateFilterDisplayInUI(callbacks = {}) {
     const container = document.querySelector(".image-deck-container");
     if (container) return renderActiveFilters(container, callbacks);
   }
   function initSidebarFilters(container, callbacks = {}) {
-    const { onApplyFilters, onClearFilters, onFilterRemoved, onSavedFilterChange, contextInfo: contextInfo2 } = callbacks;
+    const { onApplyFilters, onClearFilters, onFilterRemoved, onSavedFilterChange, onGallerySelected, contextInfo: contextInfo2 } = callbacks;
     const sidebar = container.querySelector(".image-deck-sidebar");
     if (!sidebar) return;
+    currentContextInfo = contextInfo2 || null;
     const current = getCurrentFilterTags();
     sidebarPendingFilters = {
       includedTags: [...current.includedTags || []],
@@ -2905,6 +3195,11 @@
     renderPendingFilters(container);
     if (contextInfo2) {
       renderSavedFilterDropdown(container, contextInfo2, onSavedFilterChange);
+    }
+    const isGalleryMode = contextInfo2?.type === "galleries";
+    const gallerySearchSection = sidebar.querySelector(".sidebar-gallery-search-section");
+    if (gallerySearchSection) {
+      gallerySearchSection.style.display = isGalleryMode ? "block" : "none";
     }
     const modeButtons = sidebar.querySelectorAll(".filter-mode-btn");
     modeButtons.forEach((btn) => {
@@ -2933,12 +3228,16 @@
       }, 250);
     });
     tagResults?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
       const result = e.target.closest(".sidebar-tag-result");
       if (!result) return;
+      clearTimeout(tagDebounce);
       const activeMode = sidebar.querySelector(".filter-mode-btn.active")?.dataset.mode || "include";
       addPendingFilter(result.dataset.id, result.dataset.type, activeMode);
       renderPendingFilters(container);
       tagInput.value = "";
+      tagInput.blur();
       tagResults.innerHTML = "";
       tagResults.classList.remove("active");
     });
@@ -2962,17 +3261,64 @@
       }, 250);
     });
     performerResults?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
       const result = e.target.closest(".sidebar-tag-result");
       if (!result) return;
+      clearTimeout(performerDebounce);
       const activeMode = sidebar.querySelector(".filter-mode-btn.active")?.dataset.mode || "include";
       addPendingFilter(result.dataset.id, result.dataset.type, activeMode);
       renderPendingFilters(container);
       performerInput.value = "";
+      performerInput.blur();
       performerResults.innerHTML = "";
       performerResults.classList.remove("active");
     });
+    const galleryInput = sidebar.querySelector(".sidebar-gallery-search");
+    const galleryResults = sidebar.querySelector(".sidebar-gallery-results");
+    let galleryDebounce;
+    galleryInput?.addEventListener("input", (e) => {
+      clearTimeout(galleryDebounce);
+      const q = e.target.value.trim();
+      if (!q) {
+        galleryResults.innerHTML = "";
+        galleryResults.classList.remove("active");
+        return;
+      }
+      galleryDebounce = setTimeout(async () => {
+        const galleries = await searchGalleries(q);
+        galleryResults.innerHTML = galleries.map((g) => {
+          const rawTitle = g.title || "";
+          const displayTitle = rawTitle || "Untitled";
+          return `
+          <div class="sidebar-gallery-result" data-id="${g.id}" data-title="${escapeHtml(rawTitle)}">
+            <img class="sidebar-gallery-thumb" src="${g.cover?.paths?.thumbnail || g.cover?.paths?.image || ""}" alt="" loading="lazy" decoding="async" />
+            <span class="sidebar-gallery-title">${escapeHtml(displayTitle)}</span>
+            ${g.image_count !== void 0 ? `<span class="sidebar-gallery-count">${g.image_count}</span>` : ""}
+          </div>`;
+        }).join("");
+        galleryResults.classList.toggle("active", galleries.length > 0);
+      }, 250);
+    });
+    galleryResults?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const result = e.target.closest(".sidebar-gallery-result");
+      if (!result) return;
+      clearTimeout(galleryDebounce);
+      const galleryId = result.dataset.id;
+      const title = result.dataset.title;
+      galleryInput.value = "";
+      galleryInput.blur();
+      galleryResults.innerHTML = "";
+      galleryResults.classList.remove("active");
+      if (onGallerySelected) {
+        onGallerySelected({ id: galleryId, title });
+      }
+    });
     const pendingContainer = sidebar.querySelector(".sidebar-pending-filters");
     pendingContainer?.addEventListener("click", (e) => {
+      e.stopPropagation();
       const btn = e.target.closest(".remove-pill");
       if (!btn) return;
       const pill = btn.closest(".sidebar-filter-pill");
@@ -2988,20 +3334,26 @@
       }
       renderPendingFilters(container);
     });
-    sidebar.querySelector(".sidebar-apply-btn")?.addEventListener("click", async () => {
-      const hasAny = sidebarPendingFilters.includedTags.length || sidebarPendingFilters.excludedTags.length || sidebarPendingFilters.includedPerformers.length || sidebarPendingFilters.excludedPerformers.length;
+    sidebar.querySelector(".sidebar-apply-btn")?.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const current2 = getCurrentFilterTags();
+      const merged = mergeFilters(current2, sidebarPendingFilters);
+      const hasAny = merged.includedTags.length || merged.excludedTags.length || merged.includedPerformers.length || merged.excludedPerformers.length;
       if (hasAny) {
-        sessionStorage.setItem("galleryTagFilter", JSON.stringify(sidebarPendingFilters));
+        sessionStorage.setItem("galleryTagFilter", JSON.stringify(merged));
       } else {
         sessionStorage.removeItem("galleryTagFilter");
       }
+      sidebarPendingFilters = { includedTags: [], excludedTags: [], includedPerformers: [], excludedPerformers: [] };
+      renderPendingFilters(container);
       window.dispatchEvent(new CustomEvent("galleryTagFilterChanged"));
       if (onApplyFilters) {
         await onApplyFilters();
       }
       await renderActiveFilters(container, { onFilterRemoved });
     });
-    sidebar.querySelector(".sidebar-clear-btn")?.addEventListener("click", async () => {
+    sidebar.querySelector(".sidebar-clear-btn")?.addEventListener("click", async (e) => {
+      e.stopPropagation();
       sidebarPendingFilters = { includedTags: [], excludedTags: [], includedPerformers: [], excludedPerformers: [] };
       renderPendingFilters(container);
       sessionStorage.removeItem("galleryTagFilter");
@@ -3045,18 +3397,20 @@
       }
     };
     document.addEventListener("keydown", keyHandler);
+    updateFilterButtons(container);
     return () => {
       document.removeEventListener("click", outsideClickHandler);
       document.removeEventListener("keydown", keyHandler);
     };
   }
-  var sidebarPendingFilters, SAVED_FILTER_ID_KEY, SAVED_FILTER_MODE_KEY, INT_CRITERION_FIELDS2, MULTI_CRITERION_FIELDS2;
+  var sidebarPendingFilters, currentContextInfo, SAVED_FILTER_ID_KEY, SAVED_FILTER_MODE_KEY, INT_CRITERION_FIELDS2, MULTI_CRITERION_FIELDS2;
   var init_filters = __esm({
     "filters.js"() {
       init_constants();
       init_context();
       init_context();
       sidebarPendingFilters = { includedTags: [], excludedTags: [], includedPerformers: [], excludedPerformers: [] };
+      currentContextInfo = null;
       SAVED_FILTER_ID_KEY = "imageDeckSavedFilterId";
       SAVED_FILTER_MODE_KEY = "imageDeckSavedFilterMode";
       INT_CRITERION_FIELDS2 = [
@@ -3092,15 +3446,15 @@
     const modeSection = container.querySelector(".image-deck-sidebar .mode-section .sidebar-section-content");
     if (!modeSection) return null;
     let modeIndicator = modeSection.querySelector(".mode-indicator");
-    if (!modeIndicator) {
-      modeIndicator = document.createElement("button");
-      modeIndicator.className = "mode-indicator";
-      modeIndicator.type = "button";
-      modeSection.appendChild(modeIndicator);
+    if (modeIndicator) {
+      modeIndicator.remove();
     }
-    if (onClick && !modeIndicator.dataset.deckHandler) {
+    modeIndicator = document.createElement("button");
+    modeIndicator.className = "mode-indicator";
+    modeIndicator.type = "button";
+    modeSection.appendChild(modeIndicator);
+    if (onClick) {
       modeIndicator.addEventListener("click", onClick);
-      modeIndicator.dataset.deckHandler = "true";
     }
     return modeIndicator;
   }
@@ -3144,7 +3498,7 @@
         container.classList.add("fullscreen-mode");
       } else {
         container.classList.remove("fullscreen-mode");
-        const swiper = state.getSwiper();
+        const swiper = state2.getSwiper();
         if (!swiper?.zoom || swiper.zoom.scale <= 1) {
           container.classList.remove("hiding-ui");
         }
@@ -3161,7 +3515,7 @@
     return container?.classList.contains("sidebar-open") || false;
   }
   function isZoomed() {
-    const swiper = state.getSwiper();
+    const swiper = state2.getSwiper();
     return swiper?.zoom && swiper.zoom.scale > 1;
   }
   function updateControlVisibility(isVisible = true) {
@@ -3198,7 +3552,7 @@
   }
   function syncControlVisibilityWithZoom() {
     const container = document.querySelector(".image-deck-container");
-    const swiper = state.getSwiper();
+    const swiper = state2.getSwiper();
     if (!container || !swiper?.zoom) return;
     if (isSidebarOpen()) return;
     if (swiper.zoom.scale > 1) {
@@ -3210,8 +3564,8 @@
     }
   }
   function isCurrentSlideGallery() {
-    const swiper = state.getSwiper();
-    if (!swiper) return false;
+    const swiper = state2.getSwiper();
+    if (!swiper || !swiper.slides) return false;
     const currentImages2 = window.currentImages || [];
     const currentImage = currentImages2[swiper.activeIndex];
     if (currentImage) {
@@ -3269,7 +3623,10 @@
     setDeckActive(true);
     const filterChangeListener = async (e) => {
       console.log("[Image Deck] Filter changed, updating content");
-      storedContextInfo = detectContext();
+      const ctx = detectContext();
+      if (ctx) {
+        if (typeof storedContextInfo !== "undefined") storedContextInfo = ctx;
+      }
       await updateContentViewWithFilter();
     };
     window.addEventListener("galleryTagFilterChanged", filterChangeListener);
@@ -3293,7 +3650,7 @@
       eventManager.add(button, "click", (e) => {
         showControls();
         const action = button.dataset.action;
-        const swiper2 = state.getSwiper();
+        const swiper2 = state2.getSwiper();
         if (!action) return;
         switch (action) {
           case "prev":
@@ -3359,7 +3716,7 @@
         await updateContentViewWithFilter();
       });
     });
-    const swiper = state.getSwiper();
+    const swiper = state2.getSwiper();
     let slideChangeListener = null;
     let zoomChangeListener = null;
     if (swiper) {
@@ -3379,6 +3736,8 @@
       };
       swiper.on("zoomChange", zoomChangeListener);
       setTimeout(() => {
+        const liveSwiper = state2.getSwiper();
+        if (!liveSwiper || !liveSwiper.slides) return;
         updateGalleryStateClass();
         syncControlVisibilityWithZoom();
         showControls();
@@ -3532,7 +3891,7 @@
     setTimeout(syncControlVisibilityWithZoom, 50);
   }
   function handleDoubleTapZoom(event, container) {
-    const swiper = state.getSwiper();
+    const swiper = state2.getSwiper();
     if (!swiper?.zoom) return;
     event.preventDefault();
     event.stopPropagation();
@@ -3546,7 +3905,7 @@
     const swiperEl = container.querySelector(".image-deck-swiper");
     if (!swiperEl) return;
     eventManager2.add(swiperEl, "wheel", (e) => {
-      const swiper = state.getSwiper();
+      const swiper = state2.getSwiper();
       if (!swiper) return;
       e.preventDefault();
       showControls();
@@ -3580,7 +3939,7 @@
       e.preventDefault();
       e.stopPropagation();
     }
-    const swiper = state.getSwiper();
+    const swiper = state2.getSwiper();
     if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") {
       if (e.key === "Escape") {
         closeMetadataModal();
@@ -3675,7 +4034,7 @@
       }
     });
     cleanupFunctions = [];
-    const swiper = state.getSwiper();
+    const swiper = state2.getSwiper();
     if (swiper) {
       if (swiper.keyboard?.enable) swiper.keyboard.enable();
       swiper.off("slideChangeTransitionEnd");
@@ -3760,6 +4119,12 @@
       }
     }
   }
+  function setContextInfo(context) {
+    contextInfo = context;
+    storedContextInfo2 = context;
+    window.currentContextInfo = context;
+    setSidebarContextInfo(context);
+  }
   function cleanupExistingState() {
     if (autoPlayInterval) {
       clearInterval(autoPlayInterval);
@@ -3778,14 +4143,21 @@
     });
     cleanupFunctions2 = [];
     isAutoPlaying = false;
+    isOpening = false;
+    isModeSwitching = false;
     controlsModuleCache = null;
     currentSwiper = null;
     currentImages = [];
     contextInfo = null;
     storedContextInfo2 = null;
+    window.currentContextInfo = null;
     pluginConfig = null;
     contextExtensionEnabled = false;
     sidebarCleanupFn = null;
+    lastReelRenderedCount = 0;
+    lastReelRenderedActive = -1;
+    currentGalleryName = null;
+    previousGalleryListState = null;
   }
   function buildSlideHtml(img, contextInfo2, loading = "lazy") {
     if (!img) {
@@ -3799,22 +4171,24 @@
       const imageCountDisplay = img.image_count !== void 0 ? `${GALLERY_ICON_SVG}: ${img.image_count}` : "";
       const performerNames = img.performers?.map((p) => p.name).join(", ");
       const performerDisplay = performerNames ? `<div class="gallery-performers" style="margin-top: 5px; font-size: 18px; color: #ccc;">${escapeHtml(performerNames)}</div>` : "";
+      const galleryIdMatch = img.url.match(/\/galleries\/(\d+)/);
+      const galleryId = galleryIdMatch ? galleryIdMatch[1] : "";
       return `
-            <div class="swiper-zoom-container" data-type="gallery" data-url="${img.url}">
-                <div class="gallery-cover-container">
-                    <div class="gallery-cover-title" title="${title}">${title}</div>
-                    ${imageCountDisplay ? `<div class="gallery-image-count" style="font-size: 18px; color: #ccc; margin-top: 3px;">${imageCountDisplay}</div>` : ""}
-                    <a href="${img.url}" target="_blank" class="gallery-cover-link">
-                        <img src="${fullSrc}" alt="${title}" decoding="async" loading="${loading}" />
-                    </a>
-                    ${performerDisplay}
-                </div>
-            </div>`;
+      <div class="swiper-zoom-container" data-type="gallery" data-url="${img.url}" data-gallery-id="${galleryId}">
+        <div class="gallery-cover-container">
+          <div class="gallery-cover-title" title="${title}">${title}</div>
+          ${imageCountDisplay ? `<div class="gallery-image-count" style="font-size: 18px; color: #ccc; margin-top: 3px;">${imageCountDisplay}</div>` : ""}
+          <div class="gallery-cover-link">
+            <img src="${fullSrc}" alt="${title}" decoding="async" loading="${loading}" />
+          </div>
+          ${performerDisplay}
+        </div>
+      </div>`;
     }
     return `
-        <div class="swiper-zoom-container" data-type="image">
-            <img src="${fullSrc}" alt="${title}" decoding="async" loading="${loading}" style="max-width: 100%; height: auto; display: block; margin: 0 auto;" />
-        </div>`;
+    <div class="swiper-zoom-container" data-type="image">
+      <img src="${fullSrc}" alt="${title}" decoding="async" loading="${loading}" style="max-width: 100%; height: auto; display: block; margin: 0 auto;" />
+    </div>`;
   }
   function positionKey() {
     const type = contextInfo?.type ?? "unknown";
@@ -3834,7 +4208,28 @@
       currentSwiper.slideTo(index, 0);
     }
   }
+  function updateGalleryStateClass2() {
+    const container = document.querySelector(".image-deck-container");
+    if (!container || !currentSwiper || !currentSwiper.slides) return;
+    const activeIndex = currentSwiper.activeIndex ?? 0;
+    const currentImage = window.currentImages?.[activeIndex];
+    let isGalleryCover = false;
+    if (currentImage) {
+      isGalleryCover = !!(currentImage.url && currentImage.image_count !== void 0);
+    } else {
+      const activeSlide = currentSwiper.slides?.[activeIndex];
+      if (activeSlide) {
+        const zoomContainer = activeSlide.querySelector(".swiper-zoom-container");
+        isGalleryCover = zoomContainer?.dataset.type === "gallery";
+      }
+    }
+    container.classList.toggle("gallery-active", isGalleryCover);
+  }
   function rebuildSwiperWithImages(container, images, context, startAt = 0) {
+    if (!container) {
+      console.warn("[Image Deck] rebuildSwiperWithImages called with null container");
+      return;
+    }
     if (currentSwiper && typeof currentSwiper.destroy === "function") {
       currentSwiper.destroy(true, true);
     }
@@ -3843,6 +4238,7 @@
     if (wrapper) wrapper.innerHTML = "";
     currentImages = images;
     window.currentImages = currentImages;
+    const safeStartAt = Math.max(0, Math.min(startAt, currentImages.length - 1));
     currentSwiper = initSwiper(
       container,
       currentImages,
@@ -3852,38 +4248,33 @@
         checkAndLoadNextChunk();
       },
       savePosition,
-      context
+      contextInfo,
+      safeStartAt
     );
     window.currentSwiperInstance = currentSwiper;
-    state.setSwiper(currentSwiper);
+    state2.setSwiper(currentSwiper);
     setCurrentSwiper(currentSwiper);
+    attachZoomReelCloser(container);
     requestAnimationFrame(() => {
-      if (currentSwiper) {
-        currentSwiper.update();
-        if (startAt >= 0 && startAt < currentImages.length) {
-          currentSwiper.slideTo(startAt, 0, false);
-        }
-      }
+      if (currentSwiper) currentSwiper.update();
     });
     setTimeout(() => {
       if (currentSwiper) currentSwiper.update();
     }, POST_INIT_UPDATE_DELAY_MS);
   }
-  async function forceRefreshGalleryCovers() {
-    console.log("[Image Deck] Force refreshing content");
+  async function forceRefreshGalleryCovers(targetIndex = null) {
     try {
       if (!deckContainer) return;
       const freshContext = await buildDeckContext();
       if (!freshContext) return;
-      contextInfo = freshContext;
-      storedContextInfo2 = freshContext;
+      setContextInfo(freshContext);
       currentChunkPage = 1;
       chunkSize = freshContext.filter?.perPage || pluginConfig?.chunkSize || 50;
       const result = await fetchContextImages(freshContext, 1, chunkSize);
       if (!result?.images) return;
       totalImageCount = result.totalCount || 0;
       totalPages = result.totalPages || 1;
-      rebuildSwiperWithImages(deckContainer, result.images, freshContext, 0);
+      rebuildSwiperWithImages(deckContainer, result.images, freshContext, targetIndex ?? 0);
       updateUI(deckContainer);
       renderActiveFilters(deckContainer, { onFilterRemoved: forceRefreshGalleryCovers }).catch((error) => {
         console.error("[Image Deck] Error updating filter display:", error);
@@ -3895,8 +4286,7 @@
   async function handleSavedFilterChange(savedFilter) {
     try {
       const newContext = await buildDeckContext();
-      contextInfo = newContext;
-      storedContextInfo2 = newContext;
+      setContextInfo(newContext);
       currentChunkPage = 1;
       chunkSize = newContext.filter?.perPage || pluginConfig?.chunkSize || 50;
       const result = await fetchContextImages(newContext, 1, chunkSize);
@@ -3923,7 +4313,8 @@
         onApplyFilters: forceRefreshGalleryCovers,
         onClearFilters: forceRefreshGalleryCovers,
         onFilterRemoved: forceRefreshGalleryCovers,
-        onSavedFilterChange: handleSavedFilterChange
+        onSavedFilterChange: handleSavedFilterChange,
+        onGallerySelected: handleGallerySelected
       });
       if (sidebarCleanupFn) cleanupFunctions2.push(sidebarCleanupFn);
       ensureModeIndicator(deckContainer, handleModeSwitchClick);
@@ -3932,30 +4323,231 @@
       console.error("[Image Deck] Error applying saved filter:", error);
     }
   }
+  async function resolveGalleryName() {
+    if (!contextInfo?.isSingleGallery) {
+      currentGalleryName = null;
+      return;
+    }
+    if (currentGalleryName) return;
+    if (contextInfo?.title) {
+      currentGalleryName = contextInfo.title;
+      return;
+    }
+    const galleryId = contextInfo?.id || contextInfo?.galleryId;
+    if (!galleryId) return;
+    try {
+      const meta = await fetchGalleryMetadata(galleryId);
+      if (meta?.title) {
+        currentGalleryName = meta.title;
+      }
+    } catch (e) {
+      console.warn("[Image Deck] Could not fetch gallery metadata for reel header:", e);
+    }
+  }
+  function saveGalleryListState() {
+    if (!contextInfo || contextInfo.isSingleGallery || contextInfo.type !== "galleries" || !currentSwiper) return;
+    previousGalleryListState = {
+      contextInfo: contextInfo ? JSON.parse(JSON.stringify(contextInfo)) : contextInfo,
+      storedContextInfo: storedContextInfo2 ? JSON.parse(JSON.stringify(storedContextInfo2)) : storedContextInfo2,
+      images: currentImages.slice(),
+      activeIndex: currentSwiper.activeIndex,
+      chunkSize,
+      currentChunkPage,
+      totalImageCount,
+      totalPages,
+      currentGalleryName
+    };
+  }
+  async function restoreGalleryListState() {
+    if (!previousGalleryListState || !deckContainer) return;
+    stopAutoPlay();
+    const saved = previousGalleryListState;
+    currentGalleryName = saved.currentGalleryName;
+    setContextInfo(saved.contextInfo);
+    chunkSize = saved.chunkSize;
+    currentChunkPage = saved.currentChunkPage;
+    totalImageCount = saved.totalImageCount;
+    totalPages = saved.totalPages;
+    rebuildSwiperWithImages(deckContainer, saved.images, contextInfo, saved.activeIndex);
+    updateUI(deckContainer);
+    await updateFilterDisplayInUI();
+    renderReel(deckContainer, true);
+    previousGalleryListState = null;
+  }
+  async function openGalleryInDeck(galleryId) {
+    if (!deckContainer || !galleryId) return;
+    saveGalleryListState();
+    try {
+      const [metadata, imagesResult] = await Promise.all([
+        fetchGalleryMetadata(galleryId),
+        fetchGalleryImages(galleryId, 1, 1e3)
+      ]);
+      if (!imagesResult?.images?.length) {
+        console.warn("[Image Deck] No images found in gallery:", galleryId);
+        return;
+      }
+      currentGalleryName = metadata?.title || "Untitled";
+      const newContext = {
+        ...storedContextInfo2 || contextInfo,
+        type: "galleries",
+        isSingleGallery: true,
+        id: galleryId,
+        galleryId,
+        title: currentGalleryName,
+        filter: {
+          ...storedContextInfo2?.filter || contextInfo?.filter || {},
+          galleries: { modifier: "INCLUDES", value: [galleryId] }
+        }
+      };
+      setContextInfo(newContext);
+      currentChunkPage = 1;
+      totalImageCount = imagesResult.count || imagesResult.images.length;
+      totalPages = 1;
+      chunkSize = 1e3;
+      rebuildSwiperWithImages(deckContainer, imagesResult.images, newContext, 0);
+      updateUI(deckContainer);
+      await updateFilterDisplayInUI();
+      renderReel(deckContainer, true);
+    } catch (error) {
+      console.error("[Image Deck] Error opening gallery in deck:", error);
+    }
+  }
+  function setupGalleryCoverClickHandler(container) {
+    const onClick = (e) => {
+      const link = e.target.closest(".gallery-cover-link");
+      if (!link) return;
+      const galleryContainer = link.closest('[data-type="gallery"]');
+      if (!galleryContainer) return;
+      const galleryId = galleryContainer.dataset.galleryId;
+      if (!galleryId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openGalleryInDeck(galleryId);
+    };
+    container.addEventListener("click", onClick);
+    cleanupFunctions2.push(() => container.removeEventListener("click", onClick));
+  }
+  async function handleGallerySelected(gallery) {
+    if (!gallery?.id || !deckContainer) return;
+    const targetId = String(gallery.id).trim();
+    currentGalleryName = gallery.title || "Untitled";
+    const loadedIndex = currentImages.findIndex((img) => img && String(img.id).trim() === targetId);
+    if (loadedIndex !== -1 && currentSwiper) {
+      currentSwiper.slideTo(loadedIndex, 0);
+      return;
+    }
+    try {
+      const searchContext = { ...storedContextInfo2 || contextInfo, type: "galleries" };
+      if (!searchContext.filter) searchContext.filter = {};
+      const title = (gallery.title || "").trim();
+      if (title) {
+        searchContext.filter.q = title;
+        delete searchContext.filter.id;
+      } else {
+        delete searchContext.filter.q;
+        searchContext.filter.id = {
+          modifier: "EQUALS",
+          value: parseInt(targetId, 10)
+        };
+      }
+      setContextInfo(searchContext);
+      currentChunkPage = 1;
+      chunkSize = searchContext.filter?.perPage || pluginConfig?.chunkSize || 50;
+      const result = await fetchContextImages(searchContext, 1, chunkSize);
+      if (!result?.images) {
+        console.warn("[Image Deck] Gallery search returned no images");
+        return;
+      }
+      totalImageCount = result.totalCount || 0;
+      totalPages = result.totalPages || 1;
+      rebuildSwiperWithImages(deckContainer, result.images, searchContext, 0);
+      const newIndex = result.images.findIndex((img) => img && String(img.id).trim() === targetId);
+      if (newIndex !== -1 && currentSwiper) {
+        currentSwiper.slideTo(newIndex, 0);
+      }
+      updateUI(deckContainer);
+      await updateFilterDisplayInUI();
+    } catch (error) {
+      console.error("[Image Deck] Error handling gallery selection:", error);
+    }
+  }
   async function handleModeSwitchClick(e) {
-    if (isModeSwitching) return;
+    if (isModeSwitching || !deckContainer || !currentSwiper || deckClosePromise) return;
     e.preventDefault();
     e.stopPropagation();
     isModeSwitching = true;
-    isOpening = true;
+    const modeIndicator = document.querySelector(".image-deck-sidebar .mode-indicator");
+    if (modeIndicator) modeIndicator.disabled = true;
     try {
       const currentMode = contextInfo?.type === "galleries" ? "gallery" : "image";
       const newMode = currentMode === "gallery" ? "image" : "gallery";
       const performerId = contextInfo?.performerId;
+      if (newMode === currentMode) return;
       setSavedFilterSelection(null);
       localStorage.setItem("imageDeckMode", newMode);
-      await closeDeck();
       if (performerId) {
         history.pushState({}, "", `/performers/${performerId}` + (newMode === "gallery" ? "/galleries" : "/images"));
       } else {
         history.pushState({}, "", newMode === "gallery" ? "/galleries" : "/images");
       }
-      await internalOpenDeck();
+      if (typeof window.suppressImageDeckNavigation === "function") {
+        window.suppressImageDeckNavigation(true);
+      }
+      previousGalleryListState = null;
+      if (!deckContainer || deckClosePromise) return;
+      const newContext = await buildDeckContext();
+      if (!newContext) throw new Error("Could not detect new deck context");
+      contextInfo = newContext;
+      storedContextInfo2 = newContext;
+      setSidebarContextInfo(newContext);
+      currentChunkPage = 1;
+      chunkSize = newContext.filter?.perPage || pluginConfig?.chunkSize || 50;
+      const result = await fetchContextImages(newContext, 1, chunkSize);
+      if (!result?.images) {
+        console.warn("[Image Deck] Mode switch returned no images");
+        return;
+      }
+      if (!deckContainer || deckClosePromise) return;
+      totalImageCount = result.totalCount || 0;
+      totalPages = result.totalPages || 1;
+      stopAutoPlay();
+      rebuildSwiperWithImages(deckContainer, result.images, newContext, 0);
+      if (!deckContainer || deckClosePromise) return;
+      await updateFilterDisplayInUI({ onFilterRemoved: forceRefreshGalleryCovers });
+      updateUI(deckContainer);
+      renderReel(deckContainer, true);
+      const controlsModule = await getControlsModule();
+      controlsModule.cleanupEventHandlers();
+      controlsModule.setupEventHandlers(deckContainer, {
+        closeDeck,
+        startAutoPlay,
+        stopAutoPlay,
+        loadNextChunk
+      });
+      if (sidebarCleanupFn) {
+        cleanupFunctions2 = cleanupFunctions2.filter((fn) => fn !== sidebarCleanupFn);
+        try {
+          sidebarCleanupFn();
+        } catch (e2) {
+          console.warn("[Image Deck] Sidebar cleanup error:", e2);
+        }
+      }
+      sidebarCleanupFn = initSidebarFilters(deckContainer, {
+        contextInfo: newContext,
+        onApplyFilters: forceRefreshGalleryCovers,
+        onClearFilters: forceRefreshGalleryCovers,
+        onFilterRemoved: forceRefreshGalleryCovers,
+        onSavedFilterChange: handleSavedFilterChange,
+        onGallerySelected: handleGallerySelected
+      });
+      if (sidebarCleanupFn) cleanupFunctions2.push(sidebarCleanupFn);
+      ensureModeIndicator(deckContainer, handleModeSwitchClick);
+      updateUI(deckContainer);
     } catch (error) {
       console.error("[Image Deck] Mode switch error:", error);
     } finally {
+      if (modeIndicator) modeIndicator.disabled = false;
       isModeSwitching = false;
-      isOpening = false;
     }
   }
   function setupFullscreenListener() {
@@ -3984,9 +4576,8 @@
   }
   function setupFilterUpdateListener() {
     const filterUpdateListener = async (e) => {
-      console.log("[Image Deck] Received updateDeckContent event:", e.detail);
       setTimeout(async () => {
-        await forceRefreshGalleryCovers();
+        await forceRefreshGalleryCovers(e?.detail?.targetIndex);
         if (deckContainer) {
           updateUI(deckContainer);
           await updateFilterDisplayInUI({ onFilterRemoved: forceRefreshGalleryCovers }).catch((error) => {
@@ -4017,7 +4608,7 @@
     const isTouchDevice = window.matchMedia("(pointer: coarse)").matches || "ontouchstart" in window;
     const isInteractiveTarget = (target) => {
       return target.closest(
-        "button, .image-deck-controls-wrapper, .image-deck-sidebar, .image-deck-topbar, .image-deck-info-btn, input, select, textarea, a, .image-deck-metadata-modal, .swiper-pagination, .gallery-cover-link, .image-deck-sidebar-toggle"
+        "button, .image-deck-controls-wrapper, .image-deck-sidebar, .image-deck-topbar, .image-deck-info-btn, input, select, textarea, a, .image-deck-metadata-modal, .swiper-pagination, .gallery-cover-link, .image-deck-sidebar-toggle, .image-deck-reel, .image-deck-reel-toggle, .image-deck-reel-close, .image-deck-back"
       ) !== null;
     };
     const shouldToggle = (target) => {
@@ -4067,6 +4658,162 @@
       });
     }
   }
+  function closeReel(container) {
+    if (!container) return;
+    container.classList.remove("reel-open");
+    const toggle = container.querySelector(".image-deck-reel-toggle");
+    if (toggle) toggle.innerHTML = "&#10094;";
+  }
+  function updateReelHeader(container) {
+    const headerSpan = container.querySelector(".image-deck-reel-header span");
+    if (!headerSpan) return;
+    if (contextInfo?.isSingleGallery) {
+      const name = currentGalleryName || contextInfo?.title || "Gallery";
+      headerSpan.textContent = `${name} Reel`;
+    } else if (contextInfo?.type === "galleries") {
+      headerSpan.textContent = "Gallery Select Reel";
+    } else {
+      headerSpan.textContent = "Image Reel";
+    }
+  }
+  function maybeLoadMoreForReel(container, reelList) {
+    if (!container || !reelList) return;
+    if (!container.classList.contains("reel-open")) return;
+    if (isChunkLoading) return;
+    if (!totalPages || currentChunkPage >= totalPages) return;
+    const { scrollTop, scrollHeight, clientHeight } = reelList;
+    const threshold = 5;
+    if (scrollTop + clientHeight >= scrollHeight - threshold) {
+      console.log("[Image Deck] Reel scrolled to bottom, loading next chunk");
+      loadNextChunk();
+    }
+  }
+  function setupReel(container) {
+    const toggle = container.querySelector(".image-deck-reel-toggle");
+    const closeBtn = container.querySelector(".image-deck-reel-close");
+    const reelList = container.querySelector(".image-deck-reel-list");
+    const reelPanel = container.querySelector(".image-deck-reel-panel");
+    const updateToggleIcon = () => {
+      if (!toggle) return;
+      toggle.innerHTML = container.classList.contains("reel-open") ? "&#10095;" : "&#10094;";
+    };
+    const onToggle = () => {
+      container.classList.toggle("reel-open");
+      updateToggleIcon();
+      renderReel(container, false);
+      setTimeout(() => maybeLoadMoreForReel(container, reelList), 350);
+    };
+    const onClose = () => closeReel(container);
+    const onItemClick = (e) => {
+      const item = e.target.closest(".image-deck-reel-item");
+      if (!item || !currentSwiper) return;
+      const index = parseInt(item.dataset.index, 10);
+      if (!isNaN(index) && index >= 0 && index < currentImages.length) {
+        currentSwiper.slideTo(index);
+      }
+    };
+    const onReelScroll = () => {
+      maybeLoadMoreForReel(container, reelList);
+    };
+    const onDocumentClick = (e) => {
+      if (!container.classList.contains("reel-open")) return;
+      if (e.target.closest(".image-deck-reel")) return;
+      closeReel(container);
+    };
+    let reelTouchStartX = 0;
+    let reelTouchStartY = 0;
+    const onReelTouchStart = (e) => {
+      if (e.touches.length !== 1) return;
+      reelTouchStartX = e.touches[0].clientX;
+      reelTouchStartY = e.touches[0].clientY;
+    };
+    const onReelTouchEnd = (e) => {
+      if (e.changedTouches.length !== 1) return;
+      const dx = e.changedTouches[0].clientX - reelTouchStartX;
+      const dy = e.changedTouches[0].clientY - reelTouchStartY;
+      if (dx > 60 && Math.abs(dx) > Math.abs(dy) * 2) {
+        closeReel(container);
+      }
+    };
+    if (toggle) toggle.addEventListener("click", onToggle);
+    if (closeBtn) closeBtn.addEventListener("click", onClose);
+    if (reelList) reelList.addEventListener("click", onItemClick);
+    if (reelList) reelList.addEventListener("scroll", onReelScroll, { passive: true });
+    container.addEventListener("click", onDocumentClick);
+    if (reelPanel) {
+      reelPanel.addEventListener("touchstart", onReelTouchStart, { passive: true });
+      reelPanel.addEventListener("touchend", onReelTouchEnd, { passive: true });
+    }
+    cleanupFunctions2.push(() => {
+      if (toggle) toggle.removeEventListener("click", onToggle);
+      if (closeBtn) closeBtn.removeEventListener("click", onClose);
+      if (reelList) {
+        reelList.removeEventListener("click", onItemClick);
+        reelList.removeEventListener("scroll", onReelScroll);
+      }
+      container.removeEventListener("click", onDocumentClick);
+      if (reelPanel) {
+        reelPanel.removeEventListener("touchstart", onReelTouchStart);
+        reelPanel.removeEventListener("touchend", onReelTouchEnd);
+      }
+    });
+    updateToggleIcon();
+    renderReel(container, true);
+  }
+  function renderReel(container, forceRebuild = false) {
+    if (!container || !currentSwiper) return;
+    const reelList = container.querySelector(".image-deck-reel-list");
+    if (!reelList) return;
+    updateReelHeader(container);
+    const activeIndex = currentSwiper.activeIndex ?? 0;
+    const count = currentImages.length;
+    const shouldRebuild = forceRebuild || lastReelRenderedCount !== count || !reelList.children.length;
+    let savedScrollTop = 0;
+    if (shouldRebuild && reelList.scrollTop > 0) {
+      savedScrollTop = reelList.scrollTop;
+    }
+    if (shouldRebuild) {
+      reelList.innerHTML = currentImages.map((img, i) => {
+        if (!img) return "";
+        const isGallery = img.url && !contextInfo?.isSingleGallery;
+        const thumb = img.paths?.thumbnail || img.paths?.image || "";
+        const title = escapeHtml(img.title || "Untitled");
+        return `
+        <div class="image-deck-reel-item" data-index="${i}" data-type="${isGallery ? "gallery" : "image"}" title="${title}">
+          <img class="image-deck-reel-thumb" src="${thumb}" alt="" loading="lazy" decoding="async" />
+          <span class="image-deck-reel-title">${title}</span>
+        </div>
+      `;
+      }).join("");
+      lastReelRenderedCount = count;
+      if (savedScrollTop > 0) {
+        reelList.scrollTop = savedScrollTop;
+      }
+    }
+    const items = reelList.querySelectorAll(".image-deck-reel-item");
+    items.forEach((el, i) => {
+      el.classList.toggle("active", i === activeIndex);
+    });
+    const activeEl = items[activeIndex];
+    if (activeEl && container.classList.contains("reel-open") && !savedScrollTop) {
+      activeEl.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    lastReelRenderedActive = activeIndex;
+    requestAnimationFrame(() => maybeLoadMoreForReel(container, reelList));
+  }
+  function attachZoomReelCloser(container) {
+    if (!currentSwiper || typeof currentSwiper.on !== "function") return;
+    const closeIfZoomed = () => {
+      if (currentSwiper?.zoom?.scale > 1) {
+        closeReel(container);
+      }
+    };
+    currentSwiper.on("zoomChange", (swiper, scale) => {
+      if (scale > 1) closeReel(container);
+    });
+    const pollInterval = setInterval(closeIfZoomed, 200);
+    cleanupFunctions2.push(() => clearInterval(pollInterval));
+  }
   async function openNormalDeck(startIndex = 0) {
     if (deckClosePromise) {
       console.log("[Image Deck] Deck close in progress, waiting before opening");
@@ -4101,8 +4848,9 @@
     );
     window.currentSwiperInstance = currentSwiper;
     window.currentImages = currentImages;
-    state.setSwiper(currentSwiper);
+    state2.setSwiper(currentSwiper);
     setCurrentSwiper(currentSwiper);
+    attachZoomReelCloser(container);
     if (startIndex >= 0 && startIndex < currentImages.length) {
       currentSwiper.slideTo(startIndex, 0);
     } else {
@@ -4110,6 +4858,9 @@
     }
     updateUI(container);
     await updateFilterDisplayInUI();
+    resolveGalleryName().then(() => {
+      if (deckContainer) renderReel(deckContainer, false);
+    });
     getControlsModule().then((module) => {
       module.setupEventHandlers(container, {
         closeDeck,
@@ -4124,6 +4875,8 @@
     setupFullscreenListener();
     setupSidebarVisibilityGuard();
     setupTapToToggleControls(container);
+    setupReel(container);
+    setupGalleryCoverClickHandler(container);
   }
   async function doOpenWithImages(images, startIndex = 0) {
     cleanupExistingState();
@@ -4131,8 +4884,7 @@
     chunkSize = pluginConfig?.chunkSize || 50;
     injectDynamicStyles(pluginConfig);
     const context = await buildDeckContext();
-    contextInfo = context;
-    storedContextInfo2 = context;
+    setContextInfo(context);
     currentImages = images.filter(Boolean);
     window.currentImages = currentImages;
     totalImageCount = currentImages.length;
@@ -4176,9 +4928,7 @@
     if (!context) {
       throw new Error("Could not detect deck context");
     }
-    contextInfo = context;
-    storedContextInfo2 = context;
-    console.log("[Image Deck] Context assigned:", contextInfo);
+    setContextInfo(context);
     const urlPage = context.filter?.page || 1;
     const urlPerPage = context.filter?.perPage || chunkSize;
     const result = await fetchContextImages(contextInfo, urlPage, urlPerPage);
@@ -4250,91 +5000,119 @@
     if (isMobile) {
       container.classList.add("mobile-performance-mode");
     }
+    const autoPlayIntervalMs = Math.max(100, parseInt(pluginConfig?.autoPlayInterval, 10) || 500);
     container.innerHTML = `
-        <div class="image-deck-ambient"></div>
-        <div class="image-deck-topbar">
-            <div class="image-deck-counter"></div>
-            <div class="image-deck-topbar-btns">
-                <button class="image-deck-sidebar-toggle" type="button" title="Settings">\u2699\uFE0F</button>
-                <button class="image-deck-fullscreen" title="Toggle Fullscreen">\u26F6</button>
-                <button class="image-deck-close">\u2715</button>
-            </div>
+    <div class="image-deck-ambient"></div>
+    <div class="image-deck-topbar">
+      <div class="image-deck-counter"></div>
+      <div class="image-deck-topbar-btns">
+        <button class="image-deck-back" type="button" title="Back to gallery list" style="display: none;">\u21A9</button>
+        <button class="image-deck-sidebar-toggle" type="button" title="Settings">\u2699\uFE0F</button>
+        <button class="image-deck-fullscreen" title="Toggle Fullscreen">\u26F6</button>
+        <button class="image-deck-close">\u2715</button>
+      </div>
+    </div>
+    <div class="image-deck-progress"></div>
+    <div class="image-deck-loading"></div>
+    <div class="image-deck-swiper swiper">
+      <div class="swiper-wrapper"></div>
+    </div>
+    <div class="image-deck-controls-wrapper">
+      <div class="image-deck-zoom-controls">
+        <button class="image-deck-control-btn" data-action="zoom-in" title="Zoom In (+)">\u2795</button>
+        <button class="image-deck-control-btn" data-action="zoom-out" title="Zoom Out (-)">\u2796</button>
+      </div>
+      <div class="image-deck-navigation-controls">
+        <button class="image-deck-control-btn" data-action="prev">\u23EA</button>
+        <button class="image-deck-control-btn" data-action="play">\u25B6\uFE0F</button>
+        <button class="image-deck-control-btn" data-action="next">\u23E9</button>
+        <button class="image-deck-control-btn image-deck-info-btn" data-action="info" title="Image Info (I)">\u2139\uFE0F</button>
+      </div>
+    </div>
+    <div class="image-deck-speed">Speed: ${autoPlayIntervalMs}ms</div>
+    <div class="image-deck-sidebar">
+      <button class="image-deck-sidebar-close" type="button" title="Close settings">\u2715</button>
+      <div class="image-deck-sidebar-content">
+        <div class="sidebar-section mode-section">
+          <span class="sidebar-label">Mode</span>
+          <div class="sidebar-section-content"></div>
         </div>
-        <div class="image-deck-progress"></div>
-        <div class="image-deck-loading"></div>
-        <div class="image-deck-swiper swiper">
-            <div class="swiper-wrapper"></div>
+        <div class="sidebar-section saved-filters-section">
+          <span class="sidebar-label">Saved Filter</span>
+          <select class="sidebar-saved-filter-select">
+            <option value="">-- Current view --</option>
+          </select>
         </div>
-        <div class="image-deck-controls-wrapper">
-            <div class="image-deck-zoom-controls">
-                <button class="image-deck-control-btn" data-action="zoom-in" title="Zoom In (+)">\u2795</button>
-                <button class="image-deck-control-btn" data-action="zoom-out" title="Zoom Out (-)">\u2796</button>
-            </div>
-            <div class="image-deck-navigation-controls">
-                <button class="image-deck-control-btn" data-action="prev">\u23EA</button>
-                <button class="image-deck-control-btn" data-action="play">\u25B6\uFE0F</button>
-                <button class="image-deck-control-btn" data-action="next">\u23E9</button>
-                <button class="image-deck-control-btn image-deck-info-btn" data-action="info" title="Image Info (I)">\u2139\uFE0F</button>
-            </div>
+        <div class="sidebar-section sidebar-gallery-search-section">
+          <span class="sidebar-label">Search Galleries</span>
+          <input type="text" class="sidebar-gallery-search" placeholder="Search gallery names..." autocomplete="off" />
+          <div class="sidebar-gallery-results"></div>
         </div>
-        <div class="image-deck-speed">Speed: ${pluginConfig?.autoPlayInterval || 3e3}ms</div>
-        <div class="image-deck-sidebar">
-            <button class="image-deck-sidebar-close" type="button" title="Close settings">\u2715</button>
-            <div class="image-deck-sidebar-content">
-                <div class="sidebar-section mode-section">
-                    <span class="sidebar-label">Mode</span>
-                    <div class="sidebar-section-content"></div>
-                </div>
-                <div class="sidebar-section saved-filters-section">
-                    <span class="sidebar-label">Saved Filter</span>
-                    <select class="sidebar-saved-filter-select">
-                        <option value="">-- Current view --</option>
-                    </select>
-                </div>
-                <div class="sidebar-section active-filters-section">
-                    <span class="sidebar-label">Active Filters</span>
-                    <div class="sidebar-active-filters">
-                        <div class="sidebar-empty-state">No filters applied</div>
-                    </div>
-                </div>
-                <div class="sidebar-section filter-section">
-                    <span class="sidebar-label">Tag Filter Settings</span>
-                    <div class="filter-mode-toggle">
-                        <button class="filter-mode-btn active" data-mode="include" type="button">Include</button>
-                        <button class="filter-mode-btn" data-mode="exclude" type="button">Exclude</button>
-                    </div>
-                    <input type="text" class="sidebar-tag-search" placeholder="Search tags..." autocomplete="off" />
-                    <div class="sidebar-tag-results"></div>
-                    <div class="sidebar-filter-group-label">Performers</div>
-                    <input type="text" class="sidebar-performer-search" placeholder="Search performers..." autocomplete="off" />
-                    <div class="sidebar-performer-results"></div>
-                    <div class="sidebar-filter-group-label">Selected Filters</div>
-                    <div class="sidebar-pending-filters">
-                        <div class="sidebar-empty-state">No filters selected</div>
-                    </div>
-                    <div class="sidebar-actions">
-                        <button class="sidebar-apply-btn" type="button">Apply Filters</button>
-                        <button class="sidebar-clear-btn" type="button">Clear All</button>
-                    </div>
-                </div>
-            </div>
+        <div class="sidebar-section active-filters-section">
+          <span class="sidebar-label">Active Filters</span>
+          <div class="sidebar-active-filters">
+            <div class="sidebar-empty-state">No filters applied</div>
+          </div>
         </div>
-        <div class="image-deck-metadata-modal">
-            <div class="image-deck-metadata-content">
-                <div class="image-deck-metadata-header">
-                    <h3>Image Details</h3>
-                    <button class="image-deck-metadata-close">\u2715</button>
-                </div>
-                <div class="image-deck-metadata-body"></div>
-            </div>
+        <div class="sidebar-section filter-section">
+          <span class="sidebar-label">Tag Filter Settings</span>
+          <div class="filter-mode-toggle">
+            <button class="filter-mode-btn active" data-mode="include" type="button">Include</button>
+            <button class="filter-mode-btn" data-mode="exclude" type="button">Exclude</button>
+          </div>
+          <input type="text" class="sidebar-tag-search" placeholder="Search tags..." autocomplete="off" />
+          <div class="sidebar-tag-results"></div>
+          <div class="sidebar-filter-group-label">Performers</div>
+          <input type="text" class="sidebar-performer-search" placeholder="Search performers..." autocomplete="off" />
+          <div class="sidebar-performer-results"></div>
+          <div class="sidebar-filter-group-label">Selected Filters</div>
+          <div class="sidebar-pending-filters">
+            <div class="sidebar-empty-state">No filters selected</div>
+          </div>
+          <div class="sidebar-actions">
+            <button class="sidebar-apply-btn" type="button">Apply Filters</button>
+            <button class="sidebar-clear-btn" type="button">Clear All</button>
+          </div>
         </div>
-    `;
+      </div>
+    </div>
+    <div class="image-deck-metadata-modal">
+      <div class="image-deck-metadata-content">
+        <div class="image-deck-metadata-header">
+          <h3>Image Details</h3>
+          <button class="image-deck-metadata-close">\u2715</button>
+        </div>
+        <div class="image-deck-metadata-body"></div>
+      </div>
+    </div>
+    <div class="image-deck-reel">
+      <button class="image-deck-reel-toggle" type="button" aria-label="Toggle reel">&#10094;</button>
+      <div class="image-deck-reel-panel">
+        <div class="image-deck-reel-header">
+          <span>Reel</span>
+          <button class="image-deck-reel-close" type="button" aria-label="Close reel">&#10095;</button>
+        </div>
+        <div class="image-deck-reel-list"></div>
+      </div>
+    </div>
+  `;
+    const backBtn = container.querySelector(".image-deck-back");
+    if (backBtn) {
+      const onBackClick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        restoreGalleryListState();
+      };
+      backBtn.addEventListener("click", onBackClick);
+      cleanupFunctions2.push(() => backBtn.removeEventListener("click", onBackClick));
+    }
     const filterCallbacks = { onFilterRemoved: forceRefreshGalleryCovers };
     sidebarCleanupFn = initSidebarFilters(container, {
       contextInfo,
       onApplyFilters: forceRefreshGalleryCovers,
       onClearFilters: forceRefreshGalleryCovers,
       onSavedFilterChange: handleSavedFilterChange,
+      onGallerySelected: handleGallerySelected,
       ...filterCallbacks
     });
     if (sidebarCleanupFn) cleanupFunctions2.push(sidebarCleanupFn);
@@ -4343,7 +5121,7 @@
     return container;
   }
   function updateUI(container) {
-    if (!currentSwiper || !container || uiUpdatePending) return;
+    if (!currentSwiper || !currentSwiper.slides || !container || uiUpdatePending) return;
     uiUpdatePending = true;
     requestAnimationFrame(() => {
       const modeIndicator = container.querySelector(".image-deck-sidebar .mode-indicator");
@@ -4351,6 +5129,11 @@
         const isGalleryMode = contextInfo?.type === "galleries";
         modeIndicator.innerHTML = isGalleryMode ? "\u{1F5BC}\uFE0F Gallery Mode Enabled \u{1F5BC}\uFE0F" : "\u{1F4F7} Image Mode Enabled \u{1F4F7}";
         modeIndicator.dataset.currentMode = isGalleryMode ? "gallery" : "image";
+      }
+      const backBtn = container.querySelector(".image-deck-back");
+      if (backBtn) {
+        const showBack = contextInfo?.isSingleGallery && !!previousGalleryListState;
+        backBtn.style.display = showBack ? "flex" : "none";
       }
       let current = 1;
       const displayedTotal = currentImages.length;
@@ -4371,6 +5154,8 @@
           progress.style.transform = `scaleX(${progressValue})`;
         }
       }
+      updateGalleryStateClass2();
+      renderReel(container, false);
       uiUpdatePending = false;
     });
   }
@@ -4394,6 +5179,7 @@
         if (toggle) {
           toggle.style.opacity = "1";
           toggle.style.visibility = "visible";
+          toggle.style.pointerEvents = "auto";
         }
       }
     }, 500);
@@ -4416,15 +5202,17 @@
       playBtn.innerHTML = "\u23F8";
       playBtn.classList.add("active");
     }
+    const interval = Math.max(100, parseInt(pluginConfig?.autoPlayInterval, 10) || 500);
     autoPlayInterval = setInterval(() => {
       if (currentSwiper.isEnd) {
         stopAutoPlay();
       } else {
         currentSwiper.slideNext();
       }
-    }, pluginConfig.autoPlayInterval);
+    }, interval);
     const speedIndicator = document.querySelector(".image-deck-speed");
     if (speedIndicator) {
+      speedIndicator.textContent = `Speed: ${interval}ms`;
       speedIndicator.classList.add("visible");
       setTimeout(() => speedIndicator.classList.remove("visible"), 2e3);
     }
@@ -4574,7 +5362,7 @@
     });
     return deckClosePromise;
   }
-  var CLOSE_ANIMATION_MS, POST_INIT_UPDATE_DELAY_MS, pluginConfig, currentSwiper, currentImages, autoPlayInterval, isAutoPlaying, contextInfo, currentChunkPage, chunkSize, totalImageCount, totalPages, storedContextInfo2, cleanupFunctions2, controlsModuleCache, isChunkLoading, currentFilterUpdateListener, sidebarCleanupFn, contextExtensionEnabled, deckContainer, deckClosePromise, isOpening, isModeSwitching, uiUpdatePending;
+  var CLOSE_ANIMATION_MS, POST_INIT_UPDATE_DELAY_MS, pluginConfig, currentSwiper, currentImages, autoPlayInterval, isAutoPlaying, contextInfo, currentChunkPage, chunkSize, totalImageCount, totalPages, storedContextInfo2, cleanupFunctions2, controlsModuleCache, isChunkLoading, currentFilterUpdateListener, sidebarCleanupFn, contextExtensionEnabled, deckContainer, deckClosePromise, isOpening, isModeSwitching, lastReelRenderedCount, lastReelRenderedActive, currentGalleryName, previousGalleryListState, uiUpdatePending;
   var init_deck = __esm({
     "deck.js"() {
       init_config();
@@ -4586,6 +5374,7 @@
       init_state();
       init_filters();
       init_sidebar();
+      init_graphql();
       CLOSE_ANIMATION_MS = 300;
       POST_INIT_UPDATE_DELAY_MS = 100;
       pluginConfig = null;
@@ -4609,6 +5398,10 @@
       deckClosePromise = null;
       isOpening = false;
       isModeSwitching = false;
+      lastReelRenderedCount = 0;
+      lastReelRenderedActive = -1;
+      currentGalleryName = null;
+      previousGalleryListState = null;
       uiUpdatePending = false;
       if (typeof window !== "undefined") {
         window.addEventListener("beforeunload", () => {
@@ -4684,8 +5477,11 @@
   window.addEventListener("popstate", handlePopState);
 
   // ui.js
+  init_graphql();
   var delegatedPreviewRoot = null;
   var delegatedPreviewHandler = null;
+  var sceneGalleryInterceptionInstalled = false;
+  var isOpeningSceneGallery = false;
   function isStashPreviewButton(el) {
     if (!el) return false;
     const className = (el.className || "").toString().toLowerCase();
@@ -4752,6 +5548,61 @@
     delegatedPreviewRoot = null;
     delegatedPreviewHandler = null;
   }
+  function findSceneGalleryIdForImage(img) {
+    const sceneWrap = img.closest(".scene-galleries");
+    if (!sceneWrap) return null;
+    const galleryContainer = img.closest(".gallery");
+    if (!galleryContainer) {
+      const firstLink = sceneWrap.querySelector('a[href^="/galleries/"]');
+      return firstLink?.href.match(/\/galleries\/(\d+)/)?.[1] || null;
+    }
+    const allGalleries = Array.from(sceneWrap.querySelectorAll(":scope > .gallery"));
+    const allCards = Array.from(sceneWrap.querySelectorAll(":scope > .gallery-card"));
+    const index = allGalleries.indexOf(galleryContainer);
+    const card = allCards[index];
+    const link = card?.querySelector('a[href^="/galleries/"]') || sceneWrap.querySelector('a[href^="/galleries/"]');
+    return link?.href.match(/\/galleries\/(\d+)/)?.[1] || null;
+  }
+  async function handleSceneGalleryClick(e) {
+    const img = e.target.closest(".scene-galleries .gallery-image, .scene-galleries .react-photo-gallery--gallery img");
+    if (!img || img.closest(".image-deck-container")) return;
+    const galleryId = findSceneGalleryIdForImage(img);
+    if (!galleryId) {
+      console.warn("[Image Deck] Could not determine gallery ID for clicked scene-gallery image");
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    if (isOpeningSceneGallery) return;
+    isOpeningSceneGallery = true;
+    const galleryContainer = img.closest(".gallery");
+    const galleryImages = galleryContainer ? Array.from(galleryContainer.querySelectorAll(".gallery-image")) : Array.from(img.closest(".scene-galleries")?.querySelectorAll(".gallery-image") || []);
+    const clickedIndex = galleryImages.indexOf(img);
+    try {
+      const result = await fetchGalleryImages(galleryId, 1, 1e3);
+      if (!result?.images?.length) {
+        console.warn("[Image Deck] No images found in scene gallery:", galleryId);
+        return;
+      }
+      const deck = await Promise.resolve().then(() => (init_deck(), deck_exports));
+      if (typeof deck.isDeckTransitioning === "function" && deck.isDeckTransitioning()) {
+        console.log("[Image Deck] Deck transition in progress, skipping scene gallery open");
+        return;
+      }
+      console.log("[Image Deck] Opening scene gallery", galleryId, "at index", clickedIndex);
+      await deck.openDeckWithImages(result.images, Math.max(0, clickedIndex));
+    } catch (error) {
+      console.error("[Image Deck] Error opening scene gallery in deck:", error);
+    } finally {
+      isOpeningSceneGallery = false;
+    }
+  }
+  function setupSceneGalleryInterception() {
+    if (sceneGalleryInterceptionInstalled) return;
+    sceneGalleryInterceptionInstalled = true;
+    window.addEventListener("click", handleSceneGalleryClick, true);
+  }
   function initialize() {
     console.log("[Image Deck] Initializing...");
     if (typeof Swiper === "undefined") {
@@ -4759,6 +5610,7 @@
       return;
     }
     initPreviewObserver();
+    setupSceneGalleryInterception();
     createLaunchButton();
     let debounceTimer;
     const observer = new MutationObserver(() => {
@@ -4779,10 +5631,15 @@
   }
 
   // main.js
+  init_deck();
   var originalPushState = null;
   var originalReplaceState = null;
   var popstateHandler = null;
   var navigationInterval = null;
+  var suppressNextNavigation = false;
+  window.suppressImageDeckNavigation = (value = true) => {
+    suppressNextNavigation = value;
+  };
   function initApp() {
     initialize();
   }
@@ -4808,6 +5665,13 @@
   function handleNavigation() {
     if (lastUrl === location.href) return;
     lastUrl = location.href;
+    if (suppressNextNavigation) {
+      suppressNextNavigation = false;
+      return;
+    }
+    if (typeof isDeckTransitioning === "function" && isDeckTransitioning()) {
+      return;
+    }
     const existingButton = document.querySelector(".image-deck-launch-btn");
     if (existingButton) existingButton.remove();
     const existingDeck = document.querySelector(".image-deck-container");
@@ -4832,9 +5696,7 @@
       const existingDeck = document.querySelector(".image-deck-container");
       if (existingDeck) {
         const closeBtn = existingDeck.querySelector(".image-deck-close");
-        if (closeBtn) {
-          closeBtn.click();
-        }
+        if (closeBtn) closeBtn.click();
       }
     } catch (e) {
       console.warn("[Image Deck] Error closing deck on unload:", e);
@@ -4868,6 +5730,4 @@
     initApp();
     initNavigationHandlers();
   }
-  window.addEventListener("beforeunload", handlePageUnload);
-  window.addEventListener("pagehide", handlePageUnload);
 })();
