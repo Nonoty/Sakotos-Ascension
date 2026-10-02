@@ -132,10 +132,13 @@
       recentCooldownSize: Math.min(300, Math.max(75, Math.floor(totalScenes * 0.01))),
       similarityPenalty: 0.65,
       maxSimilarityPenalty: 0.15,
+      similarityHardThreshold: 0.55,
+      similaritySoftThreshold: 0.3,
       persistentCooldownHours: 6,
       hardRepeatWindowHours: 24,
       drainModeRepeatPenalty: 0.05,
-      metadataRefreshInterval: 10
+      metadataRefreshInterval: 10,
+      sceneSessionHardCap: 3
     };
   }
   function calculateSceneSimilarity(sceneA, sceneB) {
@@ -238,14 +241,15 @@
     loserMatchCount,
     winnerStats = {},
     loserStats = {},
-    isSpecialChallenge = false
+    isSpecialChallenge = false,
+    kFactorFn = null
   }) {
     const effWinner = winnerEffectiveRating ?? winnerRating;
     const effLoser = loserEffectiveRating ?? loserRating;
     const ratingDiff = effLoser - effWinner;
     const expectedWinner = 1 / (1 + Math.pow(10, ratingDiff / 400));
-    const winnerK = getProgressiveKFactor(winnerRating, null, winnerMatchCount, mode);
-    const loserK = getProgressiveKFactor(loserRating, null, loserMatchCount, mode);
+    const winnerK = kFactorFn ? kFactorFn(winnerRating, loserRating, winnerMatchCount, mode) : getProgressiveKFactor(winnerRating, null, winnerMatchCount, mode);
+    const loserK = kFactorFn ? kFactorFn(loserRating, winnerRating, loserMatchCount, mode) : getProgressiveKFactor(loserRating, null, loserMatchCount, mode);
     const sameTier = winnerTier && loserTier && winnerTier === loserTier;
     const winnerUnderdogMult = getUnderdogMultiplier(effWinner, effLoser, sameTier);
     const effDiff = effLoser - effWinner;
@@ -651,13 +655,20 @@
     state.sessionMatchCounts = {};
     state.recentlySelectedPerformers = [];
   }
+  function getCurrentPagePerformerId() {
+    try {
+      const match = window.location.pathname.match(/\/performers\/([^\/]+)(?:\/|$)/);
+      return match ? match[1] : null;
+    } catch (e) {
+      return null;
+    }
+  }
   var state;
   var init_state = __esm({
     "state.js"() {
       init_math_utils();
       init_rating_utils();
       state = {
-        // Current Matchup Info
         currentPair: { left: null, right: null },
         currentRanks: { left: null, right: null },
         // App Configuration & Context
@@ -667,16 +678,13 @@
         // "performers", "scenes", or "images"
         totalItemsCount: 0,
         disableChoice: false,
-        // Cache of the global unfiltered performer population for percentile tier calc
         globalPerformerPool: [],
-        // Gauntlet/Champion Mode Progress
         gauntletChampion: null,
         gauntletWins: 0,
         gauntletChampionRank: 0,
         gauntletDefeated: [],
         gauntletFalling: false,
         gauntletFallingItem: null,
-        // Filters & Settings
         cachedUrlFilter: null,
         cachedSceneFilter: null,
         badgeInjectionInProgress: false,
@@ -697,13 +705,11 @@
             return ["any"];
           }
         })(),
-        // Enhanced tracking
         matchHistory: [],
         skippedIds: [],
-        // Track multiple skipped IDs
         seenPairs: /* @__PURE__ */ new Set(),
-        // Track seen performer pairs to prevent repetition
-        // Skip tracking
+        recentlySelectedScenes: [],
+        sessionSceneCounts: {},
         skippedId: null
       };
       state.tierRotation = state.tierRotation || {
@@ -1050,7 +1056,7 @@
   function escapeHtml(unsafe) {
     if (!unsafe)
       return "";
-    return String(unsafe).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    return String(unsafe).replace(/&/g, "&").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
   }
   function getCountryDisplay(countryCode) {
     if (!countryCode)
@@ -1060,10 +1066,421 @@
     const flagClass = `fi fi-${code.toLowerCase().replace(/[^a-z]/g, "")}`;
     return `<span class="${flagClass}"></span> ${name}`;
   }
+  function getRecordPreviewTooltip() {
+    if (!recordPreviewTooltip) {
+      recordPreviewTooltip = document.createElement("div");
+      recordPreviewTooltip.className = "record-preview-tooltip";
+      recordPreviewTooltip.style.position = "fixed";
+      recordPreviewTooltip.style.display = "none";
+      recordPreviewTooltip.style.zIndex = "9999";
+      recordPreviewTooltip.style.pointerEvents = "none";
+      recordPreviewTooltip.style.borderRadius = "6px";
+      recordPreviewTooltip.style.overflow = "hidden";
+      recordPreviewTooltip.style.boxShadow = "0 4px 12px rgba(0,0,0,0.5)";
+      recordPreviewTooltip.style.backgroundColor = "#000";
+      recordPreviewTooltip.style.maxWidth = "320px";
+      document.body.appendChild(recordPreviewTooltip);
+    }
+    return recordPreviewTooltip;
+  }
+  function positionTooltip(tooltip, clientX, clientY) {
+    const padding = 12;
+    const rect = tooltip.getBoundingClientRect();
+    let left = clientX + padding;
+    let top = clientY + padding;
+    if (left + rect.width > window.innerWidth) {
+      left = clientX - rect.width - padding;
+    }
+    if (top + rect.height > window.innerHeight) {
+      top = clientY - rect.height - padding;
+    }
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+  }
+  function showRecordPreview(e, oppId, isSceneRecord) {
+    const tooltip = getRecordPreviewTooltip();
+    tooltip.innerHTML = "";
+    tooltip.style.display = "block";
+    const origin = window.location.origin;
+    if (isSceneRecord) {
+      const video = document.createElement("video");
+      video.src = `${origin}/scene/${oppId}/preview`;
+      video.autoplay = true;
+      video.muted = true;
+      video.loop = true;
+      video.controls = false;
+      video.style.display = "block";
+      video.style.maxWidth = "300px";
+      video.style.maxHeight = "200px";
+      tooltip.appendChild(video);
+    } else {
+      const t = Math.floor(Date.now() / 1e3);
+      const img = document.createElement("img");
+      img.src = `${origin}/performer/${oppId}/image?t=${t}`;
+      img.alt = "Performer preview";
+      img.style.display = "block";
+      img.style.maxWidth = "200px";
+      img.style.maxHeight = "260px";
+      img.style.objectFit = "cover";
+      img.onerror = () => {
+        tooltip.innerHTML = '<div style="padding:8px;color:#aaa;">No image</div>';
+      };
+      tooltip.appendChild(img);
+    }
+    requestAnimationFrame(() => positionTooltip(tooltip, e.clientX, e.clientY));
+  }
+  function moveRecordPreview(e) {
+    const tooltip = getRecordPreviewTooltip();
+    if (tooltip.style.display === "block") {
+      positionTooltip(tooltip, e.clientX, e.clientY);
+    }
+  }
+  function hideRecordPreview() {
+    const tooltip = getRecordPreviewTooltip();
+    tooltip.style.display = "none";
+    tooltip.innerHTML = "";
+  }
+  function formatScore(score) {
+    return (score / 10).toFixed(1);
+  }
+  function getTierFromBattleScore(battleScore) {
+    if (typeof battleScore !== "number" || isNaN(battleScore))
+      return "F-Tier";
+    for (const gate of TIER_GATES) {
+      if (battleScore >= gate.minBattleScore) {
+        return gate.tier;
+      }
+    }
+    return "F-Tier";
+  }
+  function getRecordRating(match) {
+    if (match.AscRatingAfter !== void 0)
+      return match.AscRatingAfter;
+    if (match.ascended === true && match.ratingAfter !== void 0)
+      return match.ratingAfter;
+    if (match.ratingAfter !== void 0)
+      return match.ratingAfter;
+    return 0;
+  }
+  function isAscendedRating(match) {
+    if (match.AscRatingAfter !== void 0)
+      return true;
+    if (match.ascended === true)
+      return true;
+    const val = match.ratingAfter;
+    return typeof val === "number" && !Number.isInteger(val);
+  }
+  function getEffectiveBattleScore(match) {
+    const raw = getRecordRating(match);
+    if (typeof raw !== "number" || isNaN(raw))
+      return 0;
+    return isAscendedRating(match) ? raw : raw / 10;
+  }
+  function hexToRgba(hex, alpha) {
+    if (!hex || hex[0] !== "#")
+      return `rgba(128,128,128,${alpha})`;
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+  function formatLabel(key) {
+    return key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  function formatStatValue(key, value) {
+    if (key.toLowerCase().includes("rating") || key === "current_score") {
+      return formatScore(value);
+    }
+    if (key === "last_match") {
+      return new Date(value).toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true
+      });
+    }
+    return value;
+  }
+  function getStreakEmoji2(key, value) {
+    if (typeof value !== "number" || value <= 0)
+      return "";
+    if (key.toLowerCase() === "current_streak") {
+      const match = STREAK_EMOJIS2.find((s) => value >= s.min && value <= s.max);
+      return match ? " " + match.symbol : "";
+    }
+    if (key.toLowerCase() === "best_streak") {
+      return " " + STREAK_EMOJIS2.filter((s) => value >= s.min).map((s) => s.symbol).join("");
+    }
+    return "";
+  }
+  function getValueClass(key, value) {
+    if (typeof value !== "number")
+      return "";
+    if (key.toLowerCase() === "losses" && value > 0)
+      return "stat-negative";
+    if (value > 0)
+      return "stat-positive";
+    if (value < 0)
+      return "stat-negative";
+    return "";
+  }
+  function buildStatsGrid(data, isScene = false) {
+    const normalized = parsePerformerEloData({ custom_fields: { hotornot_stats: JSON.stringify(data) } });
+    const grid = document.createElement("div");
+    grid.className = isScene ? "stats-grid scene-stats-grid" : "stats-grid";
+    Object.entries(normalized).forEach(([key, value]) => {
+      const label = formatLabel(key);
+      const displayValue = formatStatValue(key, value);
+      const emoji = getStreakEmoji2(key, value);
+      const valueClass = getValueClass(key, value);
+      grid.insertAdjacentHTML(
+        "beforeend",
+        `<div class="stat-item">
+         <div class="stats-key">${label}</div>
+         <div class="stats-value ${valueClass}">
+           ${displayValue}${emoji}
+         </div>
+       </div>`
+      );
+    });
+    return grid;
+  }
+  function parseMatchOpponent(match, isSceneRecord) {
+    let oppId = null;
+    let oppName = "Unknown";
+    if (isSceneRecord) {
+      if (match.opponentId) {
+        oppId = match.opponentId.toString();
+        oppName = `Scene ${oppId}`;
+      } else if (match.opponent && typeof match.opponent === "string" && match.opponent.includes(":")) {
+        oppId = match.opponent.split(":")[0];
+        oppName = `Scene ${oppId}`;
+      }
+    } else {
+      if (match.opponent && typeof match.opponent === "string") {
+        if (match.opponent.includes(":")) {
+          const parts = match.opponent.split(":");
+          oppId = parts[0];
+          oppName = parts.slice(1).join(":") || "Unknown";
+        } else {
+          oppId = match.opponent;
+          oppName = `Performer ${oppId}`;
+        }
+      }
+    }
+    const profileUrl = isSceneRecord ? oppId ? `/scenes/${oppId}` : "#" : oppId ? `/performers/${oppId}/scenes` : "#";
+    const maxNameLength = 15;
+    const truncatedName = oppName.length > maxNameLength ? oppName.substring(0, maxNameLength) + "..." : oppName;
+    return { oppId, oppName, truncatedName, profileUrl };
+  }
+  function buildTimeline(history2, isSceneRecord = false) {
+    const timeline = document.createElement("div");
+    timeline.className = isSceneRecord ? "match-timeline scene-match-timeline" : "match-timeline";
+    [...history2].reverse().slice(0, 10).forEach((match) => {
+      const date = new Date(match.date).toLocaleDateString(void 0, {
+        month: "short",
+        day: "numeric"
+      });
+      const won = match.won;
+      const statusClass = won === true ? "win" : won === false ? "loss" : "draw";
+      const statusText = won === true ? "WIN" : won === false ? "LOSS" : "DRAW";
+      const symbol = won === true ? "\u25CF" : won === false ? "\u25CF" : "\u25CB";
+      const { truncatedName, profileUrl, oppName, oppId } = parseMatchOpponent(match, isSceneRecord);
+      const rawRating = getRecordRating(match);
+      const formattedRating = typeof rawRating === "number" ? isAscendedRating(match) ? rawRating.toFixed(2) : (rawRating / 10).toFixed(1) : "0.0";
+      const effectiveScore = getEffectiveBattleScore(match);
+      const tier = getTierFromBattleScore(effectiveScore);
+      const tierColor = getTierColor(tier);
+      const tierBg = hexToRgba(tierColor, 0.15);
+      timeline.insertAdjacentHTML("beforeend", `
+      <div class="timeline-entry ${statusClass}">
+        <span class="timeline-date">${date}</span>
+        <span class="timeline-marker">${symbol}</span>
+        <div class="timeline-content">
+          <span class="timeline-status">${statusText}</span>
+          <span class="timeline-vs">vs</span>
+          <a href="${profileUrl}" class="timeline-opponent-link" style="color: #00b2ff; text-decoration: none;" data-opponent-id="${oppId || ""}" data-is-scene-record="${isSceneRecord}">
+            ${truncatedName}
+          </a>
+        </div>
+        <div class="rating-tier-container">
+          <span class="timeline-rating" style="color: ${tierColor}; background: ${tierBg};">
+            ${formattedRating}
+          </span>
+        </div>
+      </div>
+    `);
+    });
+    timeline.querySelectorAll(".timeline-opponent-link").forEach((link) => {
+      const oppId = link.dataset.opponentId;
+      const isSceneRecordFlag = link.dataset.isSceneRecord === "true";
+      if (!oppId)
+        return;
+      link.addEventListener("mouseenter", (e) => showRecordPreview(e, oppId, isSceneRecordFlag));
+      link.addEventListener("mousemove", moveRecordPreview);
+      link.addEventListener("mouseleave", hideRecordPreview);
+    });
+    return timeline;
+  }
+  function expandCustomFields() {
+    const ASCENSION_SELECTORS = [
+      ".custom-field-hotornot_stats",
+      ".custom-field-performer_record",
+      ".custom-field-scene_record",
+      ".hotornot_stats"
+    ].join(", ");
+    document.querySelectorAll(".custom-fields").forEach((container) => {
+      const hasAscension = container.querySelector(ASCENSION_SELECTORS);
+      if (!hasAscension)
+        return;
+      const collapse = container.querySelector(".collapse");
+      const button = container.querySelector(".collapse-button");
+      const chevron = container.querySelector(".collapse-button svg");
+      if (collapse && !collapse.classList.contains("show")) {
+        collapse.classList.add("show");
+      }
+      if (button) {
+        button.setAttribute("aria-expanded", "true");
+      }
+      if (chevron) {
+        chevron.style.transform = "rotate(180deg)";
+      }
+    });
+  }
+  function observeStatsFields(textSelector, containerSelector, titleSelector, titleText) {
+    const observer3 = new MutationObserver(() => {
+      document.querySelectorAll(textSelector).forEach((el) => {
+        if (el.dataset.parsed)
+          return;
+        try {
+          const rawText = el.textContent.trim();
+          if (!rawText.startsWith("{"))
+            return;
+          const data = JSON.parse(rawText);
+          const container = el.closest(containerSelector);
+          if (!container)
+            return;
+          const titleSpan = container.querySelector(titleSelector);
+          if (titleSpan)
+            titleSpan.textContent = titleText;
+          const customFields = container.closest(".custom-fields");
+          const isScene = !!customFields?.querySelector(".custom-field-scene_record");
+          const grid = buildStatsGrid(data, isScene);
+          el.dataset.parsed = "true";
+          el.replaceWith(grid);
+        } catch (err) {
+          console.warn(`Ascension stats parse failed (${textSelector}):`, err);
+        }
+      });
+    });
+    observer3.observe(document.body, { childList: true, subtree: true });
+    return observer3;
+  }
+  function observeRecordFields() {
+    const observer3 = new MutationObserver(() => {
+      document.querySelectorAll(".custom-field-performer_record .TruncatedText, .custom-field-scene_record .TruncatedText").forEach((el) => {
+        if (el.dataset.parsed)
+          return;
+        try {
+          const rawText = el.textContent.trim();
+          if (!rawText.startsWith("["))
+            return;
+          const history2 = JSON.parse(rawText);
+          const container = el.closest(".custom-field-performer_record, .custom-field-scene_record");
+          if (!container)
+            return;
+          const isSceneRecord = container.classList.contains("custom-field-scene_record");
+          const titleSpan = container.querySelector(".detail-item-title.custom-field-performer-record, .detail-item-title.custom-field-scene-record");
+          if (titleSpan)
+            titleSpan.textContent = "Past Matchups";
+          const timeline = buildTimeline(history2, isSceneRecord);
+          el.dataset.parsed = "true";
+          el.innerHTML = "";
+          el.appendChild(timeline);
+        } catch (err) {
+          console.warn("Record timeline parse failed:", err);
+        }
+      });
+    });
+    observer3.observe(document.body, { childList: true, subtree: true });
+    return observer3;
+  }
+  function initAscensionStats() {
+    if (typeof document === "undefined" || !document.body) {
+      if (typeof document !== "undefined") {
+        document.addEventListener("DOMContentLoaded", initAscensionStats);
+      }
+      return;
+    }
+    expandCustomFields();
+    let collapseTimeout;
+    const collapseObserver = new MutationObserver(() => {
+      clearTimeout(collapseTimeout);
+      collapseTimeout = setTimeout(expandCustomFields, 50);
+    });
+    collapseObserver.observe(document.body, { childList: true, subtree: true });
+    observeStatsFields(
+      ".custom-field-hotornot_stats .TruncatedText",
+      ".custom-field-hotornot_stats",
+      ".detail-item-title.custom-field-hotornot-stats",
+      "Match History"
+    );
+    observeStatsFields(
+      ".hotornot_stats .TruncatedText",
+      ".hotornot_stats",
+      ".detail-item-title.hotornot-stats",
+      "Match History"
+    );
+    observeRecordFields();
+    const style = document.createElement("style");
+    style.textContent = `
+    .rating-tier-container {
+      display: flex;
+      align-items: center;
+      margin-left: auto;
+    }
+
+    .timeline-rating {
+      font-weight: bold;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.9rem;
+      min-width: 35px;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    .record-preview-tooltip {
+      line-height: 0;
+      transition: opacity 0.08s ease;
+    }
+
+    .record-preview-tooltip video,
+    .record-preview-tooltip img {
+      display: block;
+      border-radius: 4px;
+    }
+  `;
+    document.head.appendChild(style);
+  }
+  var recordPreviewTooltip, STREAK_EMOJIS2;
   var init_formatters = __esm({
     "formatters.js"() {
       init_constants();
-      init_constants();
+      init_rating_utils();
+      init_math_utils();
+      recordPreviewTooltip = null;
+      STREAK_EMOJIS2 = [
+        { min: 2, max: 3, symbol: "\u{1F525}" },
+        { min: 4, max: 5, symbol: "\u2764\uFE0F\u200D\u{1F525}" },
+        { min: 6, max: 8, symbol: "\u{1F48E}" },
+        { min: 9, max: 12, symbol: "\u2660\uFE0F" },
+        { min: 13, max: 17, symbol: "\u2728" },
+        { min: 18, max: Infinity, symbol: "\u{1F451}" }
+      ];
+      initAscensionStats();
     }
   });
 
@@ -1281,7 +1698,7 @@
   }
   function createSceneCard(scene, side, rank = null, gauntletStreak = null) {
     const file = scene.files?.[0] || {};
-    const performersHtml = scene.performers?.length ? scene.performers.map((p) => `<a href="/performers/${p.id}" target="_blank" class="hon-scene-link">${p.name}</a>`).join(", ") : "No performers";
+    const performersHtml = scene.performers?.length ? scene.performers.map((p) => `<a href="/performers/${p.id}" target="_blank" class="hon-scene-link" style="color: #4dabf7; text-decoration: underline;">${p.name}</a>`).join(", ") : "No performers";
     const studioHtml = scene.studio ? `<a href="/studios/${scene.studio.id}" target="_blank" class="hon-scene-link">${scene.studio.name}</a>` : "No studio";
     let title = scene.title;
     if (!title && file.path) {
@@ -1308,7 +1725,9 @@
     const imageWinnerAttr = isPictureOnly ? ` data-winner="${scene.id}"` : "";
     const htmlParts = [];
     htmlParts.push(
-      '<div class="hon-scene-card ',
+      '<div class="hon-scene-card hon-card-enter hon-card-enter-',
+      side,
+      " ",
       pictureOnlyClass,
       '" data-scene-id="',
       scene.id,
@@ -1390,16 +1809,17 @@
     const stashRating = isRated ? (rawRating / 10).toFixed(1) : "Unrated";
     let tierClass = "";
     let tierDisplay = "";
+    let tierColor = "";
     let battleScore = null;
     if (isRated) {
       const tier = getRatingTier(performer, state.globalPerformerPool);
-      const tierColor = getTierColor(tier);
+      tierColor = getTierColor(tier);
       tierDisplay = `<span style="font-weight: bold; color: ${tierColor}">${tier}</span> | `;
       tierClass = ` tier-${tier.toLowerCase().charAt(0)}`;
       battleScore = calculateBattleScore(performer);
     }
     let genderIcon = "";
-    if (!getCardDisplayOption("HideGender") && performer.gender) {
+    if (!getCardDisplayOption("HideMediaCounters") && performer.gender) {
       const genderKey = performer.gender.toUpperCase();
       genderIcon = `${GENDER_ICONS[genderKey] || "\u{1F464}"} `;
     }
@@ -1432,7 +1852,7 @@
     }
     const metaItems = [];
     if (!getCardDisplayOption("HideAscendedScore") && battleScore !== null) {
-      metaItems.push(`<div class="hon-meta-item"><strong>Ascended Score:</strong> ${tierDisplay}<span class="hon-asc-score" data-asc-score="${battleScore.toFixed(2)}">${battleScore.toFixed(2)}</span></div>`);
+      metaItems.push(`<div class="hon-meta-item"><strong>Ascended Score:</strong> ${tierDisplay}<span class="hon-asc-score" style="color: ${tierColor}; font-weight: bold;" data-asc-score="${battleScore.toFixed(2)}">${battleScore.toFixed(2)}</span></div>`);
     } else if (battleScore === null) {
       metaItems.push(`<div class="hon-meta-item"><strong>Rating:</strong> ${tierDisplay}${stashRating}</div>`);
     }
@@ -1498,7 +1918,7 @@
     const performerImageHtml = imagePath ? `<img class="hon-performer-image hon-scene-image" src="${imagePath}" alt="${name}" />` : `<div class="hon-no-image">No Image</div>`;
     const imageContainerInner = isPictureOnly ? performerImageHtml : `<a href="/performers/${performer.id}" target="_blank" class="hon-performer-link">${performerImageHtml}</a>`;
     return `
-    <div class="hon-performer-card hon-scene-card${tierClass}${pictureOnlyClass ? " " + pictureOnlyClass : ""}" data-performer-id="${performer.id}" data-side="${side}" data-rating="${performer.rating100 || 1}" data-asc-score="${battleScore?.toFixed(2) ?? ""}">
+    <div class="hon-performer-card hon-scene-card hon-card-enter hon-card-enter-${side}${tierClass}${pictureOnlyClass ? " " + pictureOnlyClass : ""}" data-performer-id="${performer.id}" data-side="${side}" data-rating="${performer.rating100 || 1}" data-asc-score="${battleScore?.toFixed(2) ?? ""}">
       <div class="hon-performer-image-container hon-scene-image-container"${imageWinnerAttr}>
         ${imageContainerInner}
         ${currentStreakDisplay}
@@ -1527,7 +1947,7 @@
     const pictureOnlyClass = isPictureOnly ? "hon-picture-only" : "";
     const imageWinnerAttr = isPictureOnly ? ` data-winner="${image.id}"` : "";
     return `
-    <div class="hon-image-card hon-scene-card ${pictureOnlyClass}" data-image-id="${image.id}" data-side="${side}" data-rating="${image.rating100 || 1}">
+    <div class="hon-image-card hon-scene-card hon-card-enter hon-card-enter-${side} ${pictureOnlyClass}" data-image-id="${image.id}" data-side="${side}" data-rating="${image.rating100 || 1}">
       <div class="hon-image-image-container hon-scene-image-container" data-image-url="/images/${image.id}"${imageWinnerAttr}>
         ${thumbnailPath ? `<img class="hon-scene-image" src="${thumbnailPath}" />` : `<div class="hon-no-image">No Image</div>`}
         ${streakDisplay}
@@ -1611,19 +2031,6 @@
     }
   });
 
-  // dom-utils.js
-  function clearDOMCache() {
-    elementCollectionCache.clear();
-    commonElementsCache.clear();
-  }
-  var elementCollectionCache, commonElementsCache;
-  var init_dom_utils = __esm({
-    "dom-utils.js"() {
-      elementCollectionCache = /* @__PURE__ */ new Map();
-      commonElementsCache = /* @__PURE__ */ new Map();
-    }
-  });
-
   // ui-event-log.js
   function initEventLog() {
     console.log = function(...args) {
@@ -1652,6 +2059,26 @@
       return String(arg);
     }).join(" ");
     if (!fullMessage.includes("[Ascension]") && !fullMessage.includes("[HotOrNot]")) {
+      return;
+    }
+    const verboseUndoPatterns = [
+      /"winnerOldStats"/,
+      /"loserOldStats"/,
+      /"pairSnapshot"/,
+      /"gauntletSnapshot"/,
+      /Restoring performer_record/i,
+      /Restoring performers\s+\d+\s+with fields/i,
+      /Restored gauntlet state/i,
+      /Restored pair snapshot/i,
+      /Successfully restored ratings and records/i,
+      /"scene_record"/,
+      /"sceneSnapshot"/,
+      /"sceneLeft"/,
+      /"sceneRight"/,
+      /Restoring scene_record/i,
+      /Restoring scenes\s+\d+\s+with fields/i
+    ];
+    if (verboseUndoPatterns.some((p) => p.test(fullMessage))) {
       return;
     }
     let readableMessage = extractReadableContent(args);
@@ -1776,23 +2203,28 @@
       }
     );
   }
+  function getEntityBasePath() {
+    return state.battleType === "scenes" ? "/scenes" : "/performers";
+  }
   function linkPerformerNames(message) {
+    const basePath = getEntityBasePath();
+    const linkClass = state.battleType === "scenes" ? "hon-log-scene-link" : "hon-log-performer-link";
     message = message.replace(
       /(Updating:|Champion Selected:)\s+([^(]+?)\s*\(ID:\s*(\d+)\)/g,
       (match, prefix, name, id) => {
-        return `${prefix} <a href="/performers/${id}" target="_blank" class="hon-log-performer-link">${name.trim()}</a> (ID: ${id})`;
+        return `${prefix} <a href="${basePath}/${id}" target="_blank" class="${linkClass}">${name.trim()}</a> (ID: ${id})`;
       }
     );
     message = message.replace(
       /(Match|CROSS-TIER|Custom Cross-Tier):\s*([^(]+?)\s*\(ID:\s*(\d+)\)\s*\(w:/gi,
       (match, prefix, name, id) => {
-        return `${prefix}: <a href="/performers/${id}" target="_blank" class="hon-log-performer-link">${name.trim()}</a> (ID: ${id}) (w:`;
+        return `${prefix}: <a href="${basePath}/${id}" target="_blank" class="${linkClass}">${name.trim()}</a> (ID: ${id}) (w:`;
       }
     );
     message = message.replace(
       /vs\s+([^(]+?)\s*\(ID:\s*(\d+)\)\s*\(w:/g,
       (match, name, id) => {
-        return `vs <a href="/performers/${id}" target="_blank" class="hon-log-performer-link">${name.trim()}</a> (ID: ${id}) (w:`;
+        return `vs <a href="${basePath}/${id}" target="_blank" class="${linkClass}">${name.trim()}</a> (ID: ${id}) (w:`;
       }
     );
     return message;
@@ -2140,7 +2572,7 @@
       });
       if (entry.tierInfo) {
         let tierColor = tierColors[entry.tierInfo] || "#00ff00";
-        const tierRegex = new RegExp(`(Tier Selection:)\\\\s+(${entry.tierInfo})`);
+        const tierRegex = new RegExp(`(Tier Selection:)\\\\\\\\s+(${entry.tierInfo})`);
         messageHtml = messageHtml.replace(
           tierRegex,
           `$1 <span style="color: ${tierColor}; font-weight: bold;">$2</span>`
@@ -2435,6 +2867,7 @@ Match Stats:`;
 \u2022 Worst Streak: ${Math.abs(stats.worst_streak)}`;
     }
     badge.title = tooltipText;
+    badge.classList.add("hon-badge-enter");
     return badge;
   }
   async function injectBattleRankBadgeInner() {
@@ -2472,7 +2905,6 @@ Match Stats:`;
           rankInfo.rating,
           rankInfo.stats,
           false,
-          // Full badge on single performer page
           tier,
           rankInfo.battleScore
         );
@@ -2775,84 +3207,78 @@ Match Stats:`;
       });
     }
   }
-  function showTierChangeNotification(card, oldRating, newRating) {
-    const oldTier = getRatingTier(oldRating);
-    const newTier = getRatingTier(newRating);
-    if (oldTier === newTier)
+  async function checkAndShowTierChange(card, oldRating100, newRating100, performer) {
+    if (!card)
+      return;
+    await initCacheFromDB();
+    const pool = allPerformersCache || state.globalPerformerPool || [];
+    const oldSnapshot = { ...performer, rating100: oldRating100 };
+    const newSnapshot = { ...performer, rating100: newRating100 };
+    const oldTier = getRatingTier(oldSnapshot, pool);
+    const newTier = getRatingTier(newSnapshot, pool);
+    if (oldTier !== newTier) {
+      showTierChangeNotification(card, oldTier, newTier);
+    }
+  }
+  function showTierChangeNotification(card, oldTier, newTier) {
+    if (!card || !oldTier || !newTier || oldTier === newTier)
       return;
     const tiers = ["F-Tier", "D-Tier", "C-Tier", "B-Tier", "A-Tier", "S-Tier"];
     const oldIndex = tiers.indexOf(oldTier);
     const newIndex = tiers.indexOf(newTier);
     const isUpgrade = newIndex > oldIndex;
     const isMobile3 = window.innerWidth <= 1200;
-    if (isMobile3) {
-      if (!card.classList.contains("active"))
-        return;
-    }
+    if (isMobile3 && !card.classList.contains("active"))
+      return;
     const notification = document.createElement("div");
     notification.className = "hon-tier-change-notification";
     const tierColor = getTierColor(newTier);
     notification.innerHTML = `Tier Change: ${isUpgrade ? "\u2B06\uFE0F" : "\u2B07\uFE0F"} <span style="color: ${tierColor}">${newTier}</span>`;
-    if (isMobile3) {
+    notification.style.position = "absolute";
+    notification.style.top = "1px";
+    notification.style.left = "50%";
+    notification.style.fontSize = "1.5rem";
+    notification.style.fontWeight = "bold";
+    notification.style.textAlign = "center";
+    notification.style.zIndex = "150";
+    notification.style.pointerEvents = "none";
+    notification.style.whiteSpace = "nowrap";
+    notification.style.opacity = "0";
+    notification.style.background = "transparent";
+    notification.style.padding = "0";
+    notification.style.borderRadius = "0";
+    notification.style.boxShadow = "none";
+    notification.style.margin = "0";
+    notification.style.transition = "opacity 0.3s ease, transform 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94)";
+    if (!isMobile3) {
       card.style.position = "relative";
-      card.classList.add("tier-changing");
-      card.appendChild(notification);
-      notification.offsetHeight;
-      setTimeout(() => {
-        notification.classList.add("show");
-      }, 10);
-      setTimeout(() => {
-        notification.classList.remove("show");
-        notification.classList.add("exit");
-        setTimeout(() => {
-          if (notification.parentNode) {
-            notification.remove();
-            card.classList.remove("tier-changing");
-          }
-        }, 400);
-      }, 2e3);
-    } else {
-      notification.style.position = "absolute";
-      notification.style.top = "1px";
-      notification.style.left = "50%";
-      notification.style.fontSize = "1.5rem";
-      notification.style.fontWeight = "bold";
-      notification.style.textAlign = "center";
-      notification.style.zIndex = "150";
-      notification.style.pointerEvents = "none";
-      notification.style.whiteSpace = "nowrap";
-      notification.style.opacity = "0";
-      notification.style.background = "transparent";
-      notification.style.padding = "0";
-      notification.style.borderRadius = "0";
-      notification.style.boxShadow = "none";
-      notification.style.margin = "0";
-      notification.style.transition = "opacity 0.3s ease, transform 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94)";
-      if (isUpgrade) {
-        notification.style.transform = "translateX(-50%) translateY(20px)";
-      } else {
-        notification.style.transform = "translateX(-50%) translateY(-20px)";
-      }
-      card.style.position = "relative";
-      card.appendChild(notification);
-      setTimeout(() => {
-        notification.style.opacity = "1";
-        notification.style.transform = "translateX(-50%) translateY(0)";
-      }, 10);
-      setTimeout(() => {
-        notification.style.opacity = "0";
-        if (isUpgrade) {
-          notification.style.transform = "translateX(-50%) translateY(-20px)";
-        } else {
-          notification.style.transform = "translateX(-50%) translateY(20px)";
-        }
-        setTimeout(() => {
-          if (notification.parentNode) {
-            notification.remove();
-          }
-        }, 300);
-      }, 1700);
     }
+    card.appendChild(notification);
+    if (isUpgrade) {
+      notification.style.transform = "translateX(-50%) translateY(20px)";
+    } else {
+      notification.style.transform = "translateX(-50%) translateY(-20px)";
+    }
+    setTimeout(() => {
+      notification.style.opacity = "1";
+      notification.style.transform = "translateX(-50%) translateY(0)";
+    }, 10);
+    setTimeout(() => {
+      notification.style.opacity = "0";
+      if (isUpgrade) {
+        notification.style.transform = "translateX(-50%) translateY(-20px)";
+      } else {
+        notification.style.transform = "translateX(-50%) translateY(20px)";
+      }
+      setTimeout(() => {
+        if (notification.parentNode) {
+          notification.remove();
+        }
+        if (isMobile3) {
+          card.classList.remove("tier-changing");
+        }
+      }, 300);
+    }, 1700);
   }
   function createBattleRankTooltip(rank, total, rating, stats = null, battleScore = null) {
     let tooltipText = `Battle Rank #${rank} of ${total} performers`;
@@ -2950,7 +3376,6 @@ Match Stats:`;
     attachedListeners.add("navigation");
   }
   function showRatingAnimation(card, oldRating, newRating, change, isWinner) {
-    showTierChangeNotification(card, oldRating, newRating);
     let overlay = card.querySelector(".hon-rating-overlay");
     if (!overlay) {
       overlay = document.createElement("div");
@@ -3084,7 +3509,8 @@ Match Stats:`;
     hidePerformerSelection: () => hidePerformerSelection,
     loadPerformerSelection: () => loadPerformerSelection,
     showPerformerSelection: () => showPerformerSelection,
-    showPlacementScreen: () => showPlacementScreen
+    showPlacementScreen: () => showPlacementScreen,
+    startGauntletWithPerformerId: () => startGauntletWithPerformerId
   });
   function formatHeight2(heightCm) {
     if (!heightCm)
@@ -3293,6 +3719,19 @@ Match Stats:`;
     }
     loadNewPair();
   }
+  async function startGauntletWithPerformerId(performerId) {
+    try {
+      const { fetchPerformerById: fetchPerformerById2 } = await Promise.resolve().then(() => (init_api_client(), api_client_exports));
+      const performer = await fetchPerformerById2(performerId);
+      if (!performer) {
+        throw new Error(`Performer ${performerId} not found`);
+      }
+      startGauntletWithPerformer(performer);
+    } catch (err) {
+      console.error(`[Ascension] Failed to auto-select page performer ${performerId}:`, err);
+      showPerformerSelection();
+    }
+  }
   function showPerformerSelection() {
     const selectionContainer = document.getElementById("hon-performer-selection");
     const comparisonArea = document.getElementById("hon-comparison-area");
@@ -3429,6 +3868,7 @@ Match Stats:`;
   function attachPerformerTooltip(element, performer, modalDialog) {
     if (!performer)
       return;
+    const isDesktop = window.innerWidth > 1200;
     element.addEventListener("mouseenter", (e) => {
       if (modalDialog) {
         removeExistingTooltips(modalDialog);
@@ -3443,18 +3883,20 @@ Match Stats:`;
       tooltip.style.backgroundColor = "rgba(0, 0, 0, 0.9)";
       tooltip.style.border = "1px solid #555";
       tooltip.style.borderRadius = "8px";
-      tooltip.style.padding = "8px";
-      tooltip.style.minWidth = "120px";
-      tooltip.style.maxWidth = "200px";
+      tooltip.style.padding = isDesktop ? "14px" : "8px";
+      tooltip.style.minWidth = isDesktop ? "180px" : "120px";
+      tooltip.style.maxWidth = isDesktop ? "320px" : "200px";
       tooltip.style.textAlign = "center";
       tooltip.style.boxShadow = "0 4px 8px rgba(0,0,0,0.3)";
       tooltip.style.pointerEvents = "none";
       tooltip.style.color = "#fff";
+      tooltip.style.fontSize = isDesktop ? "1rem" : "0.9rem";
       if (performer.image_path) {
         const fixedImagePath = fixImagePath(performer.image_path, currentOrigin);
         const imageContainer = document.createElement("div");
-        imageContainer.style.width = "80px";
-        imageContainer.style.height = "80px";
+        const imgSize = isDesktop ? "120px" : "80px";
+        imageContainer.style.width = imgSize;
+        imageContainer.style.height = imgSize;
         imageContainer.style.borderRadius = "50%";
         imageContainer.style.overflow = "hidden";
         imageContainer.style.border = "2px solid #555";
@@ -3471,7 +3913,7 @@ Match Stats:`;
           imageContainer.innerHTML = "";
           const placeholderIcon = document.createElement("span");
           placeholderIcon.innerText = "\u{1F464}";
-          placeholderIcon.style.fontSize = "2rem";
+          placeholderIcon.style.fontSize = isDesktop ? "3rem" : "2rem";
           placeholderIcon.style.color = "#888";
           placeholderIcon.style.display = "flex";
           placeholderIcon.style.alignItems = "center";
@@ -3498,32 +3940,32 @@ Match Stats:`;
       nameElement.innerText = performer.name;
       nameElement.style.color = "#fff";
       nameElement.style.fontWeight = "bold";
+      nameElement.style.fontSize = isDesktop ? "1.1rem" : "1rem";
       nameContainer.appendChild(nameElement);
       tooltip.appendChild(nameContainer);
       const ascScoreDisplay = performer.ascScore && performer.ascScore !== "N/A" ? performer.ascScore : "N/A";
       const scoreElement = document.createElement("div");
       scoreElement.innerText = `Asc.Score: ${ascScoreDisplay}`;
-      scoreElement.style.fontSize = "0.8rem";
+      scoreElement.style.fontSize = isDesktop ? "0.95rem" : "0.8rem";
       scoreElement.style.fontWeight = "bold";
       scoreElement.style.color = performer.tierColor || "#ddd";
       tooltip.appendChild(scoreElement);
-      (modalDialog || document.body).appendChild(tooltip);
+      document.body.appendChild(tooltip);
       const rect = element.getBoundingClientRect();
-      tooltip.style.left = `${rect.left + window.scrollX}px`;
-      tooltip.style.top = `${rect.bottom + window.scrollY + 8}px`;
+      tooltip.style.left = `${rect.left}px`;
+      tooltip.style.top = `${rect.bottom + 8}px`;
       const moveHandler = (ev) => {
         tooltip.style.left = `${ev.clientX + 12}px`;
         tooltip.style.top = `${ev.clientY + 18}px`;
       };
       element.addEventListener("mousemove", moveHandler);
-      element.addEventListener("mouseleave", () => {
+      const leaveHandler = () => {
         element.removeEventListener("mousemove", moveHandler);
-        setTimeout(() => {
-          if (tooltip.parentNode) {
-            tooltip.remove();
-          }
-        }, 100);
-      }, { once: true });
+        element.removeEventListener("mouseleave", leaveHandler);
+        if (tooltip.parentNode)
+          tooltip.remove();
+      };
+      element.addEventListener("mouseleave", leaveHandler);
     });
   }
   function attachNameTooltips(container, performers) {
@@ -3616,7 +4058,7 @@ Match Stats:`;
     statsModal.className = "hon-stats-modal";
     statsModal.innerHTML = `
     <div class="hon-modal-backdrop"></div>
-    <div class="hon-stats-modal-dialog">
+    <div class="hon-stats-modal-dialog hon-panel-fading-in">
       <button class="hon-modal-close">\u2715</button>
       <div class="hon-stats-loading">Loading stats...</div>
     </div>
@@ -3633,6 +4075,13 @@ Match Stats:`;
     dialogContainer.addEventListener("click", (e) => e.stopPropagation());
     statsModal.querySelector(".hon-modal-backdrop").addEventListener("click", closeStats);
     statsModal.querySelector(".hon-modal-close").addEventListener("click", closeStats);
+    const onDialogIntroEnd = (e) => {
+      if (e.target === dialogContainer && e.animationName === "hon-stats-dialog-in") {
+        dialogContainer.classList.remove("hon-panel-fading-in");
+        dialogContainer.removeEventListener("animationend", onDialogIntroEnd);
+      }
+    };
+    dialogContainer.addEventListener("animationend", onDialogIntroEnd);
     try {
       let performersToUse = cachedPerformers;
       let usedCache = false;
@@ -3664,6 +4113,10 @@ Match Stats:`;
     `;
       dialogContainer.addEventListener("click", (e) => e.stopPropagation());
       dialogContainer.querySelector(".hon-modal-close").addEventListener("click", closeStats);
+      if (!dialogContainer.classList.contains("hon-panel-fading-in")) {
+        void dialogContainer.offsetHeight;
+        dialogContainer.classList.add("hon-panel-fading-in");
+      }
       const refreshBtn = dialogContainer.querySelector("#refresh-stats-btn");
       if (refreshBtn) {
         refreshBtn.addEventListener("click", async (e) => {
@@ -3813,6 +4266,7 @@ Match Stats:`;
       }
       const [titlePart, chargingPart] = groupName.split("|||");
       const displayGroupName = chargingPart ? `${titlePart}<br><span style="font-size: 0.8em; opacity: 0.8;">${chargingPart}</span>` : groupName;
+      const groupKey = groupName.toLowerCase().replace(/\s+/g, "-");
       const rows = performersInGroup.map((p) => {
         const winRate = p.total_matches > 0 ? (p.wins / p.total_matches * 100).toFixed(1) : "0.0";
         const streakDisplay = p.current_streak > 0 ? `<span class="hon-stats-positive">+${p.current_streak}</span>` : p.current_streak < 0 ? `<span class="hon-stats-negative">${p.current_streak}</span>` : "0";
@@ -3853,18 +4307,18 @@ Match Stats:`;
         const compositeDisplay = p.total_matches > 0 ? p.compositeScore?.toFixed(2) || "0.00" : "N/A";
         const ascScoreDisplay = p.ascScore ? p.ascScore.toFixed(2) : "N/A";
         return `
-        <tr data-rank="${p.rank}" 
+        <tr data-rank="${p.rank}"
             data-ascscore="${p.ascScore || 0}"
-            data-rating="${p.rating}" 
+            data-rating="${p.rating}"
             data-raw-rating="${p.rawRating || 1}"
             data-composite-score="${p.total_matches > 0 ? p.compositeScore || 0 : ""}"
-            data-matches="${p.total_matches}" 
-            data-wins="${p.wins}" 
-            data-losses="${p.losses}" 
-            data-draws="${p.draws || 0}" 
-            data-winrate="${winRate}" 
-            data-streak="${p.current_streak}" 
-            data-beststreak="${p.best_streak}" 
+            data-matches="${p.total_matches}"
+            data-wins="${p.wins}"
+            data-losses="${p.losses}"
+            data-draws="${p.draws || 0}"
+            data-winrate="${winRate}"
+            data-streak="${p.current_streak}"
+            data-beststreak="${p.best_streak}"
             data-worststreak="${p.worst_streak}"
             data-country="${countryCodeDisplay}"
             data-gender="${p.gender}"
@@ -3894,13 +4348,13 @@ Match Stats:`;
       }).join("");
       return `
       <div class="hon-rank-group">
-        <div class="hon-rank-group-header" data-group="${groupName.toLowerCase().replace(/\s+/g, "-")}" role="button">
+        <div class="hon-rank-group-header" data-group="${groupKey}" role="button">
           <span class="hon-group-toggle">\u25B6</span>
           <span class="hon-rank-group-title" style="color: ${groupColor}; font-weight: bold;">
             ${displayGroupName}
           </span>
         </div>
-        <div class="hon-rank-group-content collapsed" data-group="${groupName.toLowerCase().replace(/\s+/g, "-")}">
+        <div class="hon-rank-group-content collapsed" data-group="${groupKey}">
           <table class="hon-stats-table">
             <thead>
               <tr>
@@ -3933,11 +4387,14 @@ Match Stats:`;
       "B-Tier": 0,
       "C-Tier": 0,
       "D-Tier": 0,
-      "F-Tier": 0
+      "F-Tier": 0,
+      "Unrated": 0
     };
     processedPerformers.forEach((p) => {
-      if (isUnratedPerformer(p))
+      if (isUnratedPerformer(p)) {
+        tierCounts["Unrated"] += 1;
         return;
+      }
       const tier = getRatingTier(p, performers);
       tierCounts[tier] = (tierCounts[tier] || 0) + 1;
     });
@@ -4012,6 +4469,7 @@ Match Stats:`;
       } else {
         groupColor = getTierColor(groupName.replace(" Performers", "").split(" ")[0]);
       }
+      const groupKey = groupName.toLowerCase().replace(/\s+/g, "-");
       const rows = performersInGroup.map((p) => {
         const winRate = p.total_matches > 0 ? (p.wins / p.total_matches * 100).toFixed(1) : "0.0";
         const streakDisplay = p.current_streak > 0 ? `<span class="hon-stats-positive">+${p.current_streak}</span>` : p.current_streak < 0 ? `<span class="hon-stats-negative">${p.current_streak}</span>` : "0";
@@ -4053,18 +4511,18 @@ Match Stats:`;
         const compositeDisplay = p.total_matches > 0 ? p.compositeScore?.toFixed(1) || "0.0" : "N/A";
         const ascScoreDisplay = p.ascScore ? p.ascScore.toFixed(2) : "N/A";
         return `
-        <tr data-rank="${p.rank}" 
+        <tr data-rank="${p.rank}"
             data-ascscore="${p.ascScore || 0}"
-            data-rating="${p.rating}" 
+            data-rating="${p.rating}"
             data-raw-rating="${p.rawRating || 1}"
             data-composite-score="${p.total_matches > 0 ? p.compositeScore || 0 : ""}"
-            data-matches="${p.total_matches}" 
-            data-wins="${p.wins}" 
-            data-losses="${p.losses}" 
-            data-draws="${p.draws || 0}" 
-            data-winrate="${winRate}" 
-            data-streak="${p.current_streak}" 
-            data-beststreak="${p.best_streak}" 
+            data-matches="${p.total_matches}"
+            data-wins="${p.wins}"
+            data-losses="${p.losses}"
+            data-draws="${p.draws || 0}"
+            data-winrate="${winRate}"
+            data-streak="${p.current_streak}"
+            data-beststreak="${p.best_streak}"
             data-worststreak="${p.worst_streak}"
             data-country="${countryCodeDisplay}"
             data-gender="${p.gender}"
@@ -4094,13 +4552,13 @@ Match Stats:`;
       }).join("");
       return `
       <div class="hon-rank-group">
-        <div class="hon-rank-group-header" data-group="${groupName.toLowerCase().replace(/\s+/g, "-")}" role="button">
+        <div class="hon-rank-group-header" data-group="${groupKey}" role="button">
           <span class="hon-group-toggle">\u25B6</span>
           <span class="hon-rank-group-title" style="color: ${groupColor}; font-weight: bold;">
             ${groupName}
           </span>
         </div>
-        <div class="hon-rank-group-content collapsed" data-group="${groupName.toLowerCase().replace(/\s+/g, "-")}">
+        <div class="hon-rank-group-content collapsed" data-group="${groupKey}">
           <table class="hon-stats-table">
             <thead>
               <tr>
@@ -4235,7 +4693,8 @@ Match Stats:`;
       { label: "B-Tier", color: "#7f1e82" },
       { label: "C-Tier", color: "#14bbe0" },
       { label: "D-Tier", color: "#92e014" },
-      { label: "F-Tier", color: "#808080" }
+      { label: "F-Tier", color: "#808080" },
+      { label: "Unrated", color: "#ffffff" }
     ];
     const nonZeroTiers = tiers.filter((tier) => (tierCounts[tier.label] || 0) > 0);
     if (nonZeroTiers.length === 0)
@@ -4260,8 +4719,8 @@ Match Stats:`;
           <span class="hon-bar-label">${tier.label}</span>
         </div>
         <div class="hon-bar-wrapper">
-          <div class="hon-bar animated-bar" 
-               data-target-width="${percentage}" 
+          <div class="hon-bar animated-bar"
+               data-target-width="${percentage}"
                data-final-count="${count}"
                data-actual-count="${count}"
                style="background-color: ${tier.color}; width: 0%;">
@@ -4283,7 +4742,9 @@ Match Stats:`;
         if (target === "distribution") {
           setTimeout(() => {
             const bars = dialog.querySelectorAll(".animated-bar:not(.animated)");
-            animateBars(bars);
+            if (bars.length > 0) {
+              animateBars(bars);
+            }
           }, 100);
         }
       };
@@ -4597,40 +5058,6 @@ Match Stats:`;
   });
 
   // ui-sidebar.js
-  var ui_sidebar_exports = {};
-  __export(ui_sidebar_exports, {
-    applySelectedSavedFilter: () => applySelectedSavedFilter,
-    applySelectedSavedSceneFilter: () => applySelectedSavedSceneFilter,
-    attachSidebarEventListeners: () => attachSidebarEventListeners,
-    autoShowOptionsIfNoGenders: () => autoShowOptionsIfNoGenders,
-    createSidebar: () => createSidebar,
-    fetchSavedPerformerFilters: () => fetchSavedPerformerFilters,
-    fetchSavedSceneFilters: () => fetchSavedSceneFilters,
-    getBadgeDisplayOption: () => getBadgeDisplayOption,
-    getCardDisplayOption: () => getCardDisplayOption2,
-    getDisableImagelessPerformers: () => getDisableImagelessPerformers,
-    getPictureOnlyMode: () => getPictureOnlyMode,
-    getSceneFilterOverrideEnabled: () => getSceneFilterOverrideEnabled,
-    getSceneMinDuration: () => getSceneMinDuration,
-    getSelectedSavedFilterId: () => getSelectedSavedFilterId,
-    getSelectedSavedSceneFilterId: () => getSelectedSavedSceneFilterId,
-    getUserFilterOverrideEnabled: () => getUserFilterOverrideEnabled,
-    onBadgeSettingsChange: () => onBadgeSettingsChange,
-    onSceneMinDurationChange: () => onSceneMinDurationChange,
-    openOptionsPanel: () => openOptionsPanel,
-    setBadgeDisplayOption: () => setBadgeDisplayOption,
-    setCardDisplayOption: () => setCardDisplayOption,
-    setDisableImagelessPerformers: () => setDisableImagelessPerformers,
-    setPictureOnlyMode: () => setPictureOnlyMode,
-    setSceneFilterOverrideEnabled: () => setSceneFilterOverrideEnabled,
-    setSceneMinDuration: () => setSceneMinDuration,
-    setSelectedSavedFilterId: () => setSelectedSavedFilterId,
-    setSelectedSavedSceneFilterId: () => setSelectedSavedSceneFilterId,
-    setUserFilterOverrideEnabled: () => setUserFilterOverrideEnabled,
-    toggleCardDisplayOption: () => toggleCardDisplayOption,
-    toggleGender: () => toggleGender,
-    toggleTier: () => toggleTier
-  });
   function getDefaultCardDisplayOptions() {
     const defaults = {};
     CARD_DISPLAY_OPTIONS.forEach((opt) => defaults[opt.key] = false);
@@ -4745,6 +5172,16 @@ Match Stats:`;
       console.warn("[Ascension] Could not load scene min duration:", err);
     }
   }
+  function getSavedPerformerFilterName(id) {
+    const filters = state.savedPerformerFilters || [];
+    const match = filters.find((f) => String(f.id) === String(id));
+    return match?.name || id || "none";
+  }
+  function getSavedSceneFilterName(id) {
+    const filters = state.savedSceneFilters || [];
+    const match = filters.find((f) => String(f.id) === String(id));
+    return match?.name || id || "none";
+  }
   function getUserFilterOverrideEnabled() {
     return state.userFilterOverride ?? DEFAULT_USER_FILTER_OVERRIDE;
   }
@@ -4755,6 +5192,8 @@ Match Stats:`;
     } catch (err) {
       console.warn("[Ascension] Could not save user filter override:", err);
     }
+    const filterName = getSavedPerformerFilterName(getSelectedSavedFilterId());
+    addEventLog(`[Ascension] Performer Filter Override ${value ? "enabled" : "disabled"}: ${filterName}`, "log");
   }
   function loadUserFilterOverride() {
     try {
@@ -4776,6 +5215,8 @@ Match Stats:`;
     } catch (err) {
       console.warn("[Ascension] Could not save scene filter override:", err);
     }
+    const filterName = getSavedSceneFilterName(getSelectedSavedSceneFilterId());
+    addEventLog(`[Ascension] Scene Filter Override ${value ? "enabled" : "disabled"}: ${filterName}`, "log");
   }
   function loadSceneFilterOverride() {
     try {
@@ -4844,9 +5285,7 @@ Match Stats:`;
         }
       }
     `);
-      const filters = (result?.findSavedFilters || []).filter(
-        (f) => f.mode === "PERFORMERS"
-      );
+      const filters = (result?.findSavedFilters || []).filter((f) => f.mode === "PERFORMERS").sort((a, b) => (a.name || "").localeCompare(b.name || ""));
       state.savedPerformerFilters = filters;
       return filters;
     } catch (err) {
@@ -4858,7 +5297,16 @@ Match Stats:`;
     const id = getSelectedSavedFilterId();
     const filters = state.savedPerformerFilters || [];
     const selected = filters.find((f) => String(f.id) === String(id));
-    state.cachedUrlFilter = selected?.object_filter || null;
+    let rawFilter = selected?.object_filter || null;
+    if (typeof rawFilter === "string") {
+      try {
+        rawFilter = JSON.parse(rawFilter);
+      } catch (err) {
+        console.warn("[Ascension] Saved performer filter object_filter is not valid JSON:", err);
+        rawFilter = null;
+      }
+    }
+    state.cachedUrlFilter = normalizeFilter(rawFilter, PERFORMER_FIELD_TYPES);
     return selected || null;
   }
   function getSelectedSavedSceneFilterId() {
@@ -4897,9 +5345,7 @@ Match Stats:`;
         }
       }
     `);
-      const filters = (result?.findSavedFilters || []).filter(
-        (f) => f.mode === "SCENES"
-      );
+      const filters = (result?.findSavedFilters || []).filter((f) => f.mode === "SCENES").sort((a, b) => (a.name || "").localeCompare(b.name || ""));
       state.savedSceneFilters = filters;
       return filters;
     } catch (err) {
@@ -4920,77 +5366,193 @@ Match Stats:`;
         rawFilter = null;
       }
     }
-    state.cachedSceneFilter = normalizeSceneFilter(rawFilter);
+    const normalized = normalizeFilter(rawFilter, SCENE_FIELD_TYPES);
+    state.cachedSceneFilter = normalized && Object.keys(normalized).length > 0 ? normalized : null;
     return selected || null;
   }
-  function normalizeSceneFilter(filter) {
-    if (!filter || typeof filter !== "object")
-      return filter;
-    const result = {};
-    for (const [key, value] of Object.entries(filter)) {
-      if (["AND", "OR", "NOT"].includes(key)) {
-        if (Array.isArray(value)) {
-          const nested = value.map(normalizeSceneFilter).filter(Boolean);
-          if (nested.length)
-            result[key] = nested;
-        } else if (value) {
-          const nested = normalizeSceneFilter(value);
-          if (nested)
-            result[key] = nested;
-        }
-        continue;
-      }
-      result[key] = normalizeCriterionValue(key, value);
+  function toBool(v) {
+    if (typeof v === "boolean")
+      return v;
+    if (typeof v === "string")
+      return /^(true|1|yes)$/i.test(v);
+    if (typeof v === "number")
+      return v !== 0;
+    if (v && typeof v === "object") {
+      if ("value" in v)
+        return toBool(v.value);
+      if ("checked" in v)
+        return toBool(v.checked);
     }
-    return result;
+    return void 0;
+  }
+  function toStr(v) {
+    if (v == null)
+      return void 0;
+    if (typeof v === "string")
+      return v;
+    if (typeof v === "number" || typeof v === "boolean")
+      return String(v);
+    if (v && typeof v === "object") {
+      if ("value" in v)
+        return toStr(v.value);
+    }
+    return void 0;
+  }
+  function toNum(v) {
+    if (v == null)
+      return void 0;
+    if (typeof v === "number")
+      return v;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      if (!Number.isNaN(n))
+        return n;
+    }
+    if (v && typeof v === "object") {
+      if ("value" in v)
+        return toNum(v.value);
+    }
+    return void 0;
+  }
+  function toFloatNum(v) {
+    if (v == null)
+      return void 0;
+    if (typeof v === "number")
+      return v;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = parseFloat(v);
+      if (!Number.isNaN(n))
+        return n;
+    }
+    if (v && typeof v === "object") {
+      if ("value" in v)
+        return toFloatNum(v.value);
+    }
+    return void 0;
+  }
+  function toEnumArray(v) {
+    if (v == null)
+      return [];
+    let arr = Array.isArray(v) ? v : [v];
+    return arr.map((item) => {
+      if (typeof item === "string")
+        return item.toUpperCase();
+      if (item && typeof item === "object") {
+        if (typeof item.value === "string")
+          return item.value.toUpperCase();
+        if (typeof item.label === "string")
+          return item.label.toUpperCase();
+      }
+      return null;
+    }).filter(Boolean);
   }
   function extractIds(items) {
     return (items || []).map((item) => typeof item === "string" ? item : item?.id).filter((id) => id != null && id !== "");
   }
-  function normalizeCriterionValue(key, criterion) {
-    if (!criterion || typeof criterion !== "object")
-      return criterion;
-    const nullaryModifiers = /* @__PURE__ */ new Set(["IS_NULL", "NOT_NULL", "IS_NOT_NULL"]);
-    if (nullaryModifiers.has(criterion.modifier)) {
-      const out = { modifier: criterion.modifier };
-      const value = criterion.value || {};
-      if ("depth" in value)
-        out.depth = value.depth;
-      else if ("depth" in criterion)
-        out.depth = criterion.depth;
-      const excludes = extractIds(value.excluded);
-      if (excludes.length)
-        out.excludes = excludes;
-      return out;
+  function normalizeField(key, criterion, types) {
+    if (criterion === null || criterion === void 0)
+      return null;
+    if (types.boolean?.has(key)) {
+      const b = toBool(criterion);
+      return b === void 0 ? null : b;
     }
-    if (isIntLikeCriterion(key, criterion)) {
-      const directValue = typeof criterion.value === "number" ? criterion.value : criterion.value?.value;
-      if (directValue === void 0 || directValue === null)
-        return criterion;
-      const { value, ...rest } = criterion;
-      return { ...rest, value: directValue };
+    if (types.stringScalar?.has(key)) {
+      const s = toStr(criterion);
+      return s === void 0 ? null : s;
     }
-    if (isHierarchicalMultiCriterion(criterion)) {
-      const value = criterion.value || {};
-      const ids = extractIds(value.items);
-      if (ids.length === 0)
+    if (typeof criterion !== "object" || Array.isArray(criterion)) {
+      if (types.stringCriterion?.has(key) && (typeof criterion === "string" || typeof criterion === "number" || typeof criterion === "boolean")) {
+        return { modifier: "EQUALS", value: String(criterion) };
+      }
+      if (types.intCriterion?.has(key) && (typeof criterion === "number" || typeof criterion === "string")) {
+        const n = toNum(criterion);
+        return n === void 0 ? null : { modifier: "EQUALS", value: n };
+      }
+      if (types.floatCriterion?.has(key) && (typeof criterion === "number" || typeof criterion === "string")) {
+        const n = toFloatNum(criterion);
+        return n === void 0 ? null : { modifier: "EQUALS", value: n };
+      }
+      if (types.enumCriterion?.has(key) && (typeof criterion === "string" || typeof criterion === "number")) {
+        const vals = toEnumArray(criterion);
+        return vals.length ? { modifier: "EQUALS", value: vals } : null;
+      }
+      if ((types.hierarchicalMulti?.has(key) || types.multi?.has(key)) && Array.isArray(criterion)) {
+        const ids = extractIds(criterion);
+        return ids.length ? { modifier: "EQUALS", value: ids } : null;
+      }
+      return null;
+    }
+    const mod = criterion.modifier || "EQUALS";
+    const isNullary = NULLARY_MODIFIERS.has(mod);
+    const value = criterion.value;
+    if (types.stringCriterion?.has(key)) {
+      if (isNullary)
+        return { modifier: mod, value: "" };
+      const s = toStr(value);
+      return s === void 0 ? null : { modifier: mod, value: s };
+    }
+    if (types.intCriterion?.has(key)) {
+      if (isNullary)
+        return { modifier: mod, value: 0 };
+      const n = toNum(value);
+      return n === void 0 ? null : { modifier: mod, value: n };
+    }
+    if (types.floatCriterion?.has(key)) {
+      if (isNullary)
+        return { modifier: mod, value: 0 };
+      const n = toFloatNum(value);
+      return n === void 0 ? null : { modifier: mod, value: n };
+    }
+    if (types.enumCriterion?.has(key)) {
+      if (isNullary)
+        return { modifier: mod, value: [] };
+      const vals = toEnumArray(value);
+      return vals.length ? { modifier: mod, value: vals } : null;
+    }
+    if (types.hierarchicalMulti?.has(key) || types.multi?.has(key)) {
+      const container = value && typeof value === "object" ? value : criterion;
+      const ids = extractIds(container.items ?? value);
+      const excludes = extractIds(container.excluded);
+      if (!ids.length && !excludes.length)
         return null;
-      const out = { modifier: criterion.modifier, value: ids };
-      if ("depth" in value)
-        out.depth = value.depth;
-      const excludes = extractIds(value.excluded);
+      if (!ids.length && excludes.length > 0) {
+        const out2 = { modifier: "EXCLUDES", value: excludes };
+        if ("depth" in container)
+          out2.depth = container.depth;
+        return out2;
+      }
+      const out = { modifier: mod, value: ids };
+      if ("depth" in container)
+        out.depth = container.depth;
       if (excludes.length)
         out.excludes = excludes;
       return out;
     }
     return criterion;
   }
-  function isIntLikeCriterion(key, criterion) {
-    const intKeys = ["tag_count", "file_count", "rating100", "o_counter", "duration", "framerate", "bitrate", "performer_count", "stash_id_count", "resume_time", "play_count", "play_duration"];
-    return intKeys.includes(key) && (typeof criterion.value === "number" || criterion.value && typeof criterion.value === "object" && typeof criterion.value.value === "number");
-  }
-  function isHierarchicalMultiCriterion(criterion) {
-    return criterion && typeof criterion === "object" && (Array.isArray(criterion.value?.items) || Array.isArray(criterion.items));
+  function normalizeFilter(filter, types) {
+    if (!filter || typeof filter !== "object")
+      return filter;
+    const result = {};
+    for (const [key, value] of Object.entries(filter)) {
+      if (["AND", "OR", "NOT"].includes(key)) {
+        if (Array.isArray(value)) {
+          const nested = value.map((v) => normalizeFilter(v, types)).filter(Boolean);
+          if (nested.length)
+            result[key] = nested;
+        } else if (value) {
+          const nested = normalizeFilter(value, types);
+          if (nested)
+            result[key] = nested;
+        }
+        continue;
+      }
+      const normalized = normalizeField(key, value, types);
+      if (normalized !== null && normalized !== void 0) {
+        result[key] = normalized;
+      }
+    }
+    return result;
   }
   function onBadgeSettingsChange(callback) {
     badgeSettingsChangeListeners.add(callback);
@@ -5046,13 +5608,19 @@ Match Stats:`;
 
           <!-- View All Stats Row -->
           <div class="hon-sidebar-row" data-action="view-stats">
-            <span class="hon-sidebar-row-text"><span class="hon-mode-icon">\u{1F4CA}</span> View All Stats</span>
+            <span class="hon-sidebar-row-text"><span class="hon-mode-icon">\u{1F4CA}</span> Performer Statistics</span>
+          </div>
+
+          <!-- Metrics Dashboard Row -->
+          <div class="hon-sidebar-row" data-action="view-metrics-dashboard">
+            <span class="hon-sidebar-row-text"><span class="hon-mode-icon">\u{1F4C2}</span> Metrics Dashboard</span>
           </div>
 
           <!-- Options Row -->
           <div class="hon-sidebar-row" data-action="open-options">
             <span class="hon-sidebar-row-text"><span class="hon-mode-icon">\u2699\uFE0F</span> Options</span>
           </div>
+
         </div>
       </div>
     </div>
@@ -5124,13 +5692,24 @@ Match Stats:`;
           const { loadNewPair: loadNewPair2 } = await Promise.resolve().then(() => (init_battle_engine(), battle_engine_exports));
           loadNewPair2();
         } else if (mode === "gauntlet" || mode === "champion") {
-          if (selectionContainer)
-            selectionContainer.style.display = "block";
-          if (comparisonArea)
-            comparisonArea.style.display = "none";
-          if (actionsEl)
-            actionsEl.style.display = "none";
-          Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection());
+          const pagePerformerId = getCurrentPagePerformerId();
+          if (pagePerformerId) {
+            if (selectionContainer)
+              selectionContainer.style.display = "none";
+            if (comparisonArea)
+              comparisonArea.style.display = "";
+            if (actionsEl)
+              actionsEl.style.display = "";
+            Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.startGauntletWithPerformerId(pagePerformerId));
+          } else {
+            if (selectionContainer)
+              selectionContainer.style.display = "block";
+            if (comparisonArea)
+              comparisonArea.style.display = "none";
+            if (actionsEl)
+              actionsEl.style.display = "none";
+            Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection());
+          }
         } else if (mode === "scenes") {
           if (selectionContainer)
             selectionContainer.style.display = "none";
@@ -5138,6 +5717,10 @@ Match Stats:`;
             comparisonArea.style.display = "";
           if (actionsEl)
             actionsEl.style.display = "";
+          state.gauntletChampion = null;
+          state.gauntletFalling = false;
+          state.gauntletWins = 0;
+          state.battleType = "scenes";
           const { loadNewPair: loadNewPair2 } = await Promise.resolve().then(() => (init_battle_engine(), battle_engine_exports));
           loadNewPair2();
         }
@@ -5154,6 +5737,9 @@ Match Stats:`;
             closeOptionsPanel();
           }
           Promise.resolve().then(() => (init_ui_stats(), ui_stats_exports)).then((m) => m.openStatsModal());
+        }
+        if (action === "view-metrics-dashboard") {
+          window.location.href = "/stats";
         }
         if (action === "open-options") {
           if (optionsRestoreState.optionsOpen) {
@@ -5415,7 +6001,7 @@ Match Stats:`;
           <label class="hon-options-checkbox ${overrideEnabled ? "active" : ""}" data-user-filter-override>
             <input type="checkbox" ${overrideEnabled ? "checked" : ""}>
             <span class="hon-options-checkmark">\u2713</span>
-            <span class="hon-options-label-text">Enable User Filter Override</span>
+            <span class="hon-options-label-text">Enable Performer Filter Override</span>
           </label>
           <label class="hon-options-checkbox ${getDisableImagelessPerformers() ? "active" : ""}" data-disable-imageless>
             <input type="checkbox" ${getDisableImagelessPerformers() ? "checked" : ""}>
@@ -5554,6 +6140,9 @@ Match Stats:`;
         const id = e.target.value;
         setSelectedSavedFilterId(id);
         applySelectedSavedFilter();
+        if (id) {
+          addEventLog(`[Ascension] Performer Filter selected: ${getSavedPerformerFilterName(id)}`, "log");
+        }
       });
     }
     const sceneFilterOverrideCheckbox = vsContainer.querySelector('[data-scene-filter-override] input[type="checkbox"]');
@@ -5582,6 +6171,9 @@ Match Stats:`;
         setSelectedSavedSceneFilterId(id);
         applySelectedSavedSceneFilter();
         state.sceneMetadataCache = null;
+        if (id) {
+          addEventLog(`[Ascension] Scene Filter selected: ${getSavedSceneFilterName(id)}`, "log");
+        }
       });
     }
     fetchSavedPerformerFilters().then(() => {
@@ -5594,8 +6186,7 @@ Match Stats:`;
         <option value="">-- Select a saved filter --</option>
         ${filters.map((f) => `
           <option value="${f.id}" ${String(f.id) === String(selectedId) ? "selected" : ""}>${f.name}</option>
-        `).join("")}
-      `;
+        `).join("")}`;
       savedFilterSelect2.disabled = !getUserFilterOverrideEnabled();
       applySelectedSavedFilter();
     });
@@ -5609,8 +6200,7 @@ Match Stats:`;
         <option value="">-- Select a saved scene filter --</option>
         ${filters.map((f) => `
           <option value="${f.id}" ${String(f.id) === String(selectedId) ? "selected" : ""}>${f.name}</option>
-        `).join("")}
-      `;
+        `).join("")}`;
       savedSceneFilterSelect2.disabled = !getSceneFilterOverrideEnabled();
       applySelectedSavedSceneFilter();
     });
@@ -5641,11 +6231,25 @@ Match Stats:`;
       actionsEl.style.display = "";
     }
     if (optionsRestoreState.wasSelectionVisible) {
-      if (selectionContainer)
-        selectionContainer.style.display = "block";
-      if (comparisonArea)
-        comparisonArea.style.display = "none";
-      Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection());
+      const pagePerformerId = getCurrentPagePerformerId();
+      const onPerformerPage = pagePerformerId && (state.currentMode === "gauntlet" || state.currentMode === "champion" || state.battleType === "scenes");
+      if (onPerformerPage) {
+        if (selectionContainer)
+          selectionContainer.style.display = "none";
+        if (comparisonArea)
+          comparisonArea.style.display = "";
+        if (actionsEl)
+          actionsEl.style.display = "";
+        Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.startGauntletWithPerformerId(pagePerformerId));
+      } else {
+        if (selectionContainer)
+          selectionContainer.style.display = "block";
+        if (comparisonArea)
+          comparisonArea.style.display = "none";
+        if (actionsEl)
+          actionsEl.style.display = "none";
+        Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection());
+      }
     } else {
       if (selectionContainer)
         selectionContainer.style.display = "none";
@@ -5655,7 +6259,7 @@ Match Stats:`;
       loadNewPair2();
     }
   }
-  var ALL_GENDERS2, TIER_ORDER_FOR_GAP, CARD_DISPLAY_LS_KEY, CARD_DISPLAY_OPTIONS, PICTURE_ONLY_MODE_KEY, ALL_HIDE_OPTIONS, BADGE_DISPLAY_LS_KEY, BADGE_DISPLAY_OPTIONS, SCENE_MIN_DURATION_LS_KEY, DEFAULT_SCENE_MIN_DURATION, USER_FILTER_OVERRIDE_LS_KEY, DEFAULT_USER_FILTER_OVERRIDE, SCENE_FILTER_OVERRIDE_LS_KEY, DEFAULT_SCENE_FILTER_OVERRIDE, DISABLE_IMAGELESS_LS_KEY, DEFAULT_DISABLE_IMAGELESS, SAVED_FILTER_LS_KEY, SAVED_SCENE_FILTER_LS_KEY, optionsRestoreState, badgeSettingsChangeListeners, sceneMinDurationChangeListeners;
+  var ALL_GENDERS2, TIER_ORDER_FOR_GAP, CARD_DISPLAY_LS_KEY, CARD_DISPLAY_OPTIONS, PICTURE_ONLY_MODE_KEY, ALL_HIDE_OPTIONS, BADGE_DISPLAY_LS_KEY, BADGE_DISPLAY_OPTIONS, SCENE_MIN_DURATION_LS_KEY, DEFAULT_SCENE_MIN_DURATION, USER_FILTER_OVERRIDE_LS_KEY, DEFAULT_USER_FILTER_OVERRIDE, SCENE_FILTER_OVERRIDE_LS_KEY, DEFAULT_SCENE_FILTER_OVERRIDE, DISABLE_IMAGELESS_LS_KEY, DEFAULT_DISABLE_IMAGELESS, SAVED_FILTER_LS_KEY, SAVED_SCENE_FILTER_LS_KEY, SCENE_FIELD_TYPES, PERFORMER_FIELD_TYPES, NULLARY_MODIFIERS, optionsRestoreState, badgeSettingsChangeListeners, sceneMinDurationChangeListeners;
   var init_ui_sidebar = __esm({
     "ui-sidebar.js"() {
       init_state();
@@ -5704,6 +6308,97 @@ Match Stats:`;
       DEFAULT_DISABLE_IMAGELESS = true;
       SAVED_FILTER_LS_KEY = "hon_selected_saved_filter_id";
       SAVED_SCENE_FILTER_LS_KEY = "hon_selected_saved_scene_filter_id";
+      SCENE_FIELD_TYPES = {
+        boolean: /* @__PURE__ */ new Set([
+          "organized",
+          "interactive",
+          "performer_favorite"
+        ]),
+        stringScalar: /* @__PURE__ */ new Set([
+          "is_missing",
+          "has_markers"
+        ]),
+        stringCriterion: /* @__PURE__ */ new Set([
+          "title",
+          "code",
+          "details",
+          "director",
+          "oshash",
+          "checksum",
+          "phash",
+          "path",
+          "video_codec",
+          "audio_codec",
+          "url",
+          "captions"
+        ]),
+        intCriterion: /* @__PURE__ */ new Set([
+          "id",
+          "file_count",
+          "rating100",
+          "o_counter",
+          "duration",
+          "framerate",
+          "bitrate",
+          "performer_count",
+          "stash_id_count",
+          "resume_time",
+          "play_count",
+          "play_duration",
+          "tag_count",
+          "performer_age"
+        ]),
+        enumCriterion: /* @__PURE__ */ new Set(["orientation", "resolution"]),
+        hierarchicalMulti: /* @__PURE__ */ new Set(["studios", "groups", "tags", "performer_tags"]),
+        multi: /* @__PURE__ */ new Set(["movies", "galleries", "performers"]),
+        floatCriterion: /* @__PURE__ */ new Set([])
+      };
+      PERFORMER_FIELD_TYPES = {
+        boolean: /* @__PURE__ */ new Set([
+          "filter_favorites",
+          "ignore_auto_tag"
+        ]),
+        stringScalar: /* @__PURE__ */ new Set([
+          "is_missing"
+        ]),
+        stringCriterion: /* @__PURE__ */ new Set([
+          "name",
+          "disambiguation",
+          "details",
+          "ethnicity",
+          "country",
+          "eye_color",
+          "measurements",
+          "fake_tits",
+          "career_length",
+          "tattoos",
+          "piercings",
+          "aliases",
+          "url",
+          "hair_color"
+        ]),
+        intCriterion: /* @__PURE__ */ new Set([
+          "birth_year",
+          "age",
+          "height_cm",
+          "tag_count",
+          "scene_count",
+          "marker_count",
+          "image_count",
+          "gallery_count",
+          "play_count",
+          "o_counter",
+          "stash_id_count",
+          "rating100",
+          "weight",
+          "death_year"
+        ]),
+        floatCriterion: /* @__PURE__ */ new Set(["penis_length"]),
+        enumCriterion: /* @__PURE__ */ new Set(["gender", "circumcised"]),
+        hierarchicalMulti: /* @__PURE__ */ new Set(["tags", "studios", "groups"]),
+        multi: /* @__PURE__ */ new Set(["performers"])
+      };
+      NULLARY_MODIFIERS = /* @__PURE__ */ new Set(["IS_NULL", "NOT_NULL", "IS_NOT_NULL"]);
       loadCardDisplayOptions();
       loadBadgeDisplayOptions();
       loadSceneMinDuration();
@@ -5731,9 +6426,11 @@ Match Stats:`;
         await fetchSavedSceneFilters();
         if (getUserFilterOverrideEnabled()) {
           applySelectedSavedFilter();
+          addEventLog(`[Ascension] Performer Filter Override enabled: ${getSavedPerformerFilterName(getSelectedSavedFilterId())}`, "log");
         }
         if (getSceneFilterOverrideEnabled()) {
           applySelectedSavedSceneFilter();
+          addEventLog(`[Ascension] Scene Filter Override enabled: ${getSavedSceneFilterName(getSelectedSavedSceneFilterId())}`, "log");
         }
       })();
     }
@@ -5756,6 +6453,152 @@ Match Stats:`;
     "parsers.js"() {
       init_constants();
       init_ui_sidebar();
+    }
+  });
+
+  // scene-handler.js
+  function computeSceneRatingBands(scenes, requestedBandCount) {
+    if (!Array.isArray(scenes) || scenes.length < MIN_SCENE_BANDS * 2) {
+      return null;
+    }
+    const ratings = scenes.map((s) => s.rating100 ?? 1).filter((r) => typeof r === "number" && !isNaN(r)).sort((a, b) => a - b);
+    if (ratings.length < MIN_SCENE_BANDS * 2) {
+      return null;
+    }
+    const bandCount = requestedBandCount ?? Math.max(
+      MIN_SCENE_BANDS,
+      Math.min(MAX_SCENE_BANDS, Math.floor(scenes.length / 50))
+    );
+    const bands = [];
+    for (let i = 0; i < bandCount; i++) {
+      const lowerPercentile = i / bandCount;
+      const upperPercentile = (i + 1) / bandCount;
+      const lowerIndex = Math.max(0, Math.floor(lowerPercentile * ratings.length));
+      const upperIndex = Math.min(ratings.length - 1, Math.ceil(upperPercentile * ratings.length) - 1);
+      bands.push({
+        index: i,
+        lowerBound: ratings[lowerIndex],
+        upperBound: ratings[upperIndex],
+        lowerPercentile,
+        upperPercentile
+      });
+    }
+    return {
+      min: ratings[0],
+      max: ratings[ratings.length - 1],
+      count: bandCount,
+      bands
+    };
+  }
+  function getSceneBandIndex(scene, bandData) {
+    if (!bandData || !bandData.bands)
+      return 0;
+    const rating = scene?.rating100 ?? 1;
+    if (rating <= bandData.min)
+      return 0;
+    if (rating >= bandData.max)
+      return bandData.bands.length - 1;
+    return bandData.bands.find((b) => rating >= b.lowerBound && rating <= b.upperBound)?.index ?? 0;
+  }
+  function filterCandidatesByRatingBand(candidates, seedScene, bandData, maxBandGap = 1) {
+    if (!bandData)
+      return candidates;
+    const seedBand = getSceneBandIndex(seedScene, bandData);
+    return candidates.filter((item) => {
+      const scene = item.scene || item;
+      const candidateBand = getSceneBandIndex(scene, bandData);
+      return Math.abs(candidateBand - seedBand) <= maxBandGap;
+    });
+  }
+  function getMinimumCandidateCount(totalPool) {
+    return Math.max(8, Math.min(25, Math.floor(Math.sqrt(totalPool) * 1.5)));
+  }
+  function widenBandWindowUntilMinimum(candidates, seedScene, bandData, totalPool) {
+    if (!bandData)
+      return candidates;
+    const minCandidates = getMinimumCandidateCount(totalPool);
+    const maxPossibleGap = bandData.bands.length - 1;
+    let result = [];
+    let maxGap = 0;
+    while (maxGap <= maxPossibleGap && result.length < minCandidates) {
+      result = filterCandidatesByRatingBand(candidates, seedScene, bandData, maxGap);
+      if (result.length >= minCandidates)
+        break;
+      maxGap++;
+    }
+    if (result.length === 0 && candidates.length > 0) {
+      result = candidates.map((item) => ({
+        ...item,
+        bandDistance: Math.abs(
+          getSceneBandIndex(seedScene, bandData) - getSceneBandIndex(item.scene || item, bandData)
+        )
+      })).sort((a, b) => a.bandDistance - b.bandDistance).slice(0, Math.min(minCandidates, candidates.length)).map(({ bandDistance, ...rest }) => rest);
+    }
+    return result.length > 0 ? result : candidates;
+  }
+  function getSceneProgressiveKFactor(rating, opponentRating, matchCount, mode = "swiss") {
+    const count = matchCount || 0;
+    const experienceFactor = 0.5 + 0.5 / (1 + Math.exp((count - 18) / 6));
+    let baseK = 20 * experienceFactor;
+    if (rating > 40) {
+      const reductionFactor = Math.max(0.3, 1 - (rating - 40) / 50);
+      baseK *= reductionFactor;
+    }
+    if (opponentRating != null && rating > opponentRating) {
+      const gap = rating - opponentRating;
+      if (gap > 1) {
+        const gapFactor = Math.max(0.15, 1 - (gap - 1) / 50);
+        baseK *= gapFactor;
+      }
+    }
+    if (mode === "champion") {
+      return Math.min(22, Math.max(3, Math.round(baseK * 0.85)));
+    } else if (mode === "gauntlet") {
+      return Math.min(28, Math.max(4, Math.round(baseK * 1.1)));
+    }
+    return Math.min(24, Math.max(3, Math.round(baseK)));
+  }
+  function calculateSceneMatchOutcome({
+    winnerRating,
+    loserRating,
+    winnerEffectiveRating,
+    loserEffectiveRating,
+    mode,
+    winnerMatchCount,
+    loserMatchCount,
+    winnerStats = {},
+    loserStats = {},
+    isSpecialChallenge = false
+  }) {
+    const outcome = calculateMatchOutcome({
+      winnerRating,
+      loserRating,
+      winnerEffectiveRating,
+      loserEffectiveRating,
+      winnerTier: null,
+      loserTier: null,
+      mode,
+      winnerMatchCount,
+      loserMatchCount,
+      winnerStats,
+      loserStats,
+      isSpecialChallenge,
+      kFactorFn: getSceneProgressiveKFactor
+    });
+    if (winnerMatchCount < 3 && winnerRating < loserRating - 0.5) {
+      const volatilityCap = Math.max(5, 11 - winnerMatchCount * 2);
+      outcome.winnerGain = Math.min(outcome.winnerGain, volatilityCap);
+    }
+    outcome.winnerGain = Math.max(1, outcome.winnerGain);
+    outcome.loserLoss = Math.max(0, outcome.loserLoss);
+    return outcome;
+  }
+  var MIN_SCENE_BANDS, MAX_SCENE_BANDS;
+  var init_scene_handler = __esm({
+    "scene-handler.js"() {
+      init_math_utils();
+      MIN_SCENE_BANDS = 3;
+      MAX_SCENE_BANDS = 7;
     }
   });
 
@@ -6152,26 +6995,43 @@ Match Stats:`;
       const isFallingWinner = state.gauntletFalling && !!state.gauntletFallingItem && winnerId === state.gauntletFallingItem.id;
       const isChampionLoser = !!state.gauntletChampion && loserId === state.gauntletChampion.id;
       const isFallingLoser = state.gauntletFalling && !!state.gauntletFallingItem && loserId === state.gauntletFallingItem.id;
-      ({ winnerGain, loserLoss } = calculateMatchOutcome({
-        winnerRating,
-        loserRating,
-        winnerEffectiveRating,
-        loserEffectiveRating,
-        winnerTier,
-        loserTier,
-        mode: state.currentMode,
-        winnerMatchCount,
-        loserMatchCount,
-        isChampionWinner,
-        isFallingWinner,
-        isChampionLoser,
-        isFallingLoser,
-        loserRank,
-        winnerStats,
-        loserStats,
-        isSpecialChallenge: state.currentPair?.isSpecialChallenge || false,
-        specialChallengeRules: state.currentPair?.specialChallengeRules || null
-      }));
+      if (state.battleType === "scenes") {
+        let sceneOutcome = calculateSceneMatchOutcome({
+          winnerRating,
+          loserRating,
+          winnerEffectiveRating,
+          loserEffectiveRating,
+          mode: state.currentMode,
+          winnerMatchCount,
+          loserMatchCount,
+          winnerStats,
+          loserStats,
+          isSpecialChallenge: state.currentPair?.isSpecialChallenge || false
+        });
+        winnerGain = sceneOutcome.winnerGain;
+        loserLoss = sceneOutcome.loserLoss;
+      } else {
+        ({ winnerGain, loserLoss } = calculateMatchOutcome({
+          winnerRating,
+          loserRating,
+          winnerEffectiveRating,
+          loserEffectiveRating,
+          winnerTier,
+          loserTier,
+          mode: state.currentMode,
+          winnerMatchCount,
+          loserMatchCount,
+          isChampionWinner,
+          isFallingWinner,
+          isChampionLoser,
+          isFallingLoser,
+          loserRank,
+          winnerStats,
+          loserStats,
+          isSpecialChallenge: state.currentPair?.isSpecialChallenge || false,
+          specialChallengeRules: state.currentPair?.specialChallengeRules || null
+        }));
+      }
     }
     const newWinnerRating = Math.min(100, Math.max(1, winnerRating + winnerGain));
     const newLoserRating = Math.min(100, Math.max(1, loserRating - loserLoss));
@@ -6240,7 +7100,7 @@ Match Stats:`;
       console.log(`[Ascension Timing] Parallel updates completed in ${(updateEndTime - updateStartTime).toFixed(2)} ms.`);
     } catch (updateError) {
       const updateEndTime = performance.now();
-      console.error(`[Ascension Timing] One or both updates failed after ${(updateEndTime - updateStartTime).toFixed(2)} ms:`, updateError);
+      console.error(`[Ascension] Timing] One or both updates failed after ${(updateEndTime - updateStartTime).toFixed(2)} ms:`, updateError);
       throw updateError;
     }
     const endTime = performance.now();
@@ -6532,11 +7392,12 @@ Match Stats:`;
           opponentData = `${oppId}:${oppName || "Unknown"}`;
         }
       }
+      const ascendedRatingAfter = Number.isFinite(newBattleScore) ? Math.round(newBattleScore * 100) / 100 : 0;
       matchHistory.push({
         date: (/* @__PURE__ */ new Date()).toISOString(),
         opponent: opponentData,
         won,
-        ratingAfter: cleanRating
+        AscRatingAfter: ascendedRatingAfter
       });
       if (matchHistory.length > 30)
         matchHistory = matchHistory.slice(-30);
@@ -6659,6 +7520,7 @@ Match Stats:`;
       init_parsers();
       init_math_utils();
       init_state();
+      init_scene_handler();
       FRAGMENTS = {
         PERFORMER: `id name image_path rating100 details custom_fields birthdate ethnicity country gender height_cm measurements fake_tits scene_count image_count gallery_count tags { name }`,
         IMAGE: `id rating100 paths { thumbnail image }`,
@@ -6690,6 +7552,16 @@ Match Stats:`;
     const battleScore = calculateBattleScore(performer);
     return Math.round(battleScore * 10);
   }
+  function updateUndoButtonVisibility() {
+    const btn = document.getElementById("hon-undo-btn");
+    if (!btn)
+      return;
+    if (state.matchHistory && state.matchHistory.length > 0) {
+      btn.classList.remove("hon-action-hidden");
+    } else {
+      btn.classList.add("hon-action-hidden");
+    }
+  }
   async function handleChooseItem(event) {
     if (state.disableChoice)
       return;
@@ -6709,7 +7581,8 @@ Match Stats:`;
     const loserRank = isLeftWinner ? state.currentRanks.right : state.currentRanks.left;
     if (state.battleType === "images") {
       const outcome2 = await handleComparison(winnerId, loserId, winnerRating, loserRating, null, winnerItem, loserItem);
-      applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome2);
+      await applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome2);
+      updateUndoButtonVisibility();
       setTimeout(() => loadNewPair(), 800);
       return;
     }
@@ -6724,7 +7597,7 @@ Match Stats:`;
         loserItem,
         false
       );
-      applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome2);
+      await applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome2);
       return outcome2;
     };
     if (state.currentMode === "gauntlet") {
@@ -6732,6 +7605,7 @@ Match Stats:`;
         const outcome2 = await recordModeOutcome();
         winnerItem.rating100 = outcome2.newWinnerRating;
         loserItem.rating100 = outcome2.newLoserRating;
+        updateUndoButtonVisibility();
         if (winnerId === state.gauntletFallingItem.id) {
           const placedRank = isLeftWinner ? state.currentRanks.left : state.currentRanks.right;
           setTimeout(() => {
@@ -6750,6 +7624,7 @@ Match Stats:`;
         state.gauntletChampion = winnerItem;
         state.gauntletWins++;
         state.gauntletDefeated.push(loserId);
+        updateUndoButtonVisibility();
         if (state.gauntletWins >= state.totalItemsCount - 1) {
           setTimeout(() => {
             const victoryScreen = createVictoryScreen(state.gauntletChampion, state.battleType, state.gauntletWins, state.totalItemsCount);
@@ -6776,6 +7651,7 @@ Match Stats:`;
         state.gauntletDefeated = [];
         state.gauntletFalling = true;
         state.gauntletFallingItem = loserItem;
+        updateUndoButtonVisibility();
         setTimeout(() => loadNewPair(), 800);
         return;
       }
@@ -6797,6 +7673,7 @@ Match Stats:`;
         state.gauntletWins = 1;
         state.gauntletDefeated = [loserId];
       }
+      updateUndoButtonVisibility();
       setTimeout(() => loadNewPair(), 800);
       return;
     }
@@ -6810,7 +7687,8 @@ Match Stats:`;
       loserItem,
       false
     );
-    applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome);
+    await applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome);
+    updateUndoButtonVisibility();
     setTimeout(() => loadNewPair(), 800);
   }
   async function handleSkip(event) {
@@ -6838,8 +7716,9 @@ Match Stats:`;
       state.skippedIds = state.skippedIds.slice(-100);
     }
     loadNewPair();
+    updateUndoButtonVisibility();
   }
-  function applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome) {
+  async function applyVisualFeedback(winnerCard, loserCard, winnerItem, loserItem, winnerDisplayRating, loserDisplayRating, outcome) {
     winnerCard.classList.add("hon-winner");
     if (loserCard)
       loserCard.classList.add("hon-loser");
@@ -6869,6 +7748,12 @@ Match Stats:`;
     const winnerDisplayChange = outcome.winnerChange;
     const loserNewDisplayRating = loserIsBattleScore ? loserDisplayRating + outcome.loserChange : outcome.newLoserRating;
     const loserDisplayChange = outcome.loserChange;
+    if (state.battleType === "performers") {
+      await checkAndShowTierChange(winnerCard, winnerItem.rating100, outcome.newWinnerRating, winnerItem);
+      if (loserCard) {
+        await checkAndShowTierChange(loserCard, loserItem.rating100, outcome.newLoserRating, loserItem);
+      }
+    }
     showRatingAnimation(winnerCard, winnerDisplayRating, winnerNewDisplayRating, winnerDisplayChange, true);
     if (loserCard) {
       showRatingAnimation(loserCard, loserDisplayRating, loserNewDisplayRating, loserDisplayChange, false);
@@ -6887,13 +7772,14 @@ Match Stats:`;
     const undoBtn = document.getElementById("hon-undo-btn");
     if (undoBtn) {
       undoBtn.disabled = true;
-      undoBtn.textContent = "\u{1F504}";
+      undoBtn.textContent = "\u21BA";
     }
     try {
-      console.log("[Ascension] Starting undo operation...");
       const pairSnapshot = await undoLastMatch();
+      if (pairSnapshot?.left?.name && pairSnapshot?.right?.name) {
+        console.log(`[Ascension] Undoing match: ${pairSnapshot.left.name} (ID: ${pairSnapshot.left.id}) vs ${pairSnapshot.right.name} (ID: ${pairSnapshot.right.id})`);
+      }
       if (pairSnapshot?.left && pairSnapshot?.right) {
-        console.log("[Ascension] Re-rendering previous pair from snapshot");
         const { renderCard: renderCard2 } = await Promise.resolve().then(() => (init_ui_manager(), ui_manager_exports));
         const { attachBattleListeners: attachBattleListeners2 } = await Promise.resolve().then(() => (init_battle_engine(), battle_engine_exports));
         const area = document.getElementById("hon-comparison-area");
@@ -6927,8 +7813,8 @@ Match Stats:`;
       const btn = document.getElementById("hon-undo-btn");
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "\u21A9";
-        btn.style.display = state.matchHistory && state.matchHistory.length > 0 ? "inline-block" : "none";
+        btn.textContent = "Undo Match";
+        updateUndoButtonVisibility();
       }
     }
   }
@@ -6939,6 +7825,7 @@ Match Stats:`;
       init_ui_manager();
       init_battle_engine();
       init_rating_utils();
+      init_ui_badge();
     }
   });
 
@@ -6953,12 +7840,12 @@ Match Stats:`;
     fetchGauntletPairScenes: () => fetchGauntletPairScenes,
     fetchPair: () => fetchPair,
     fetchRandomScenes: () => fetchRandomScenes,
-    fetchSceneCount: () => fetchSceneCount,
     fetchSwissPairImages: () => fetchSwissPairImages,
     fetchSwissPairPerformers: () => fetchSwissPairPerformers,
     fetchSwissPairScenes: () => fetchSwissPairScenes,
     handleMatchmakingLogic: () => handleMatchmakingLogic,
-    loadNewPair: () => loadNewPair
+    loadNewPair: () => loadNewPair,
+    startSceneModeForCurrentPerformer: () => startSceneModeForCurrentPerformer
   });
   function isNonVotingClick(e) {
     return !!e.target.closest("a.hon-scene-link, a.hon-performer-link, .hon-tags-more, .hon-focus-btn");
@@ -6982,7 +7869,55 @@ Match Stats:`;
     return getSceneDuration(scene) >= minDuration;
   }
   function getEffectiveSceneFilter() {
-    return getSceneFilterOverrideEnabled() ? state.cachedSceneFilter : null;
+    const savedFilter = getSceneFilterOverrideEnabled() ? state.cachedSceneFilter : null;
+    const pagePerformerId = getCurrentPagePerformerId();
+    if (!pagePerformerId) {
+      return savedFilter;
+    }
+    const performerSceneFilter = {
+      performers: { value: [pagePerformerId], modifier: "INCLUDES" }
+    };
+    if (!savedFilter) {
+      return performerSceneFilter;
+    }
+    return {
+      AND: [savedFilter, performerSceneFilter]
+    };
+  }
+  function loadSceneCooldownState() {
+    try {
+      const recentRaw = localStorage.getItem(SCENE_RECENT_LS_KEY);
+      if (recentRaw) {
+        const parsed = JSON.parse(recentRaw);
+        if (Array.isArray(parsed)) {
+          state.recentlySelectedScenes = parsed.filter((entry) => {
+            const ts = entry?.timestamp || 0;
+            return Date.now() - ts < SCENE_RECENT_COOLDOWN_MS;
+          });
+        }
+      }
+    } catch (err) {
+      console.warn("[Ascension] Could not load persisted scene cooldown:", err);
+    }
+    try {
+      const sessionRaw = localStorage.getItem(SCENE_SESSION_LS_KEY);
+      if (sessionRaw) {
+        const parsed = JSON.parse(sessionRaw);
+        if (parsed && typeof parsed === "object") {
+          state.sessionSceneCounts = {};
+          const now = Date.now();
+          for (const [sceneId, data] of Object.entries(parsed)) {
+            if (!data || typeof data !== "object")
+              continue;
+            if (now - (data.lastSeenAt || 0) < SCENE_SESSION_COOLDOWN_MS) {
+              state.sessionSceneCounts[sceneId] = data;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[Ascension] Could not load persisted scene session counts:", err);
+    }
   }
   function attachBattleListeners(area) {
     if (area._battleCleanup) {
@@ -7259,11 +8194,30 @@ Match Stats:`;
     }
     return { items: await fetchRandomPerformers(2), ranks: [null, null], isVictory: false };
   }
+  async function startSceneModeForCurrentPerformer() {
+    const pagePerformerId = getCurrentPagePerformerId();
+    if (!pagePerformerId)
+      return;
+    state.battleType = "scenes";
+    state.scenePerformerId = pagePerformerId;
+    state.currentPair = null;
+    state.currentRanks = null;
+    const area = document.getElementById("hon-comparison-area");
+    if (area) {
+      if (area._battleCleanup)
+        area._battleCleanup();
+      area.innerHTML = "";
+    }
+    await loadNewPair();
+  }
   async function loadNewPair() {
     state.disableChoice = false;
     const area = document.getElementById("hon-comparison-area");
     if (!area)
       return;
+    if (state.battleType === "scenes" && getCurrentPagePerformerId()) {
+      state.scenePerformerId = getCurrentPagePerformerId();
+    }
     const undoBtn = document.getElementById("hon-undo-btn");
     if (undoBtn) {
       undoBtn.style.display = state.matchHistory && state.matchHistory.length > 0 ? "inline-block" : "none";
@@ -7271,6 +8225,13 @@ Match Stats:`;
       undoBtn.textContent = "\u21A9";
     }
     if ((state.currentMode === "gauntlet" || state.currentMode === "champion") && state.battleType === "performers" && !state.gauntletChampion && !state.gauntletFalling) {
+      const pagePerformerId = getCurrentPagePerformerId();
+      if (pagePerformerId) {
+        if (area._battleCleanup)
+          area._battleCleanup();
+        Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.startGauntletWithPerformerId(pagePerformerId));
+        return;
+      }
       if (area._battleCleanup)
         area._battleCleanup();
       showPerformerSelection();
@@ -7478,7 +8439,7 @@ Match Stats:`;
   `;
     const variables = {
       filter: {
-        per_page: 100,
+        per_page: 200,
         sort: "random"
       }
     };
@@ -7491,8 +8452,31 @@ Match Stats:`;
     if (eligibleScenes.length < 2) {
       throw new Error("Not enough scenes above the minimum duration for comparison.");
     }
-    const shuffled = [...eligibleScenes].sort(() => Math.random() - 0.5);
-    return shuffled.slice(0, count);
+    let pool = eligibleScenes.filter((scene) => !isSceneSessionBlocked(scene.id) && !isSceneRecentlySelected(scene.id));
+    if (pool.length < count) {
+      pool = eligibleScenes.filter((scene) => !isSceneSessionBlocked(scene.id));
+    }
+    if (pool.length < count) {
+      pool = eligibleScenes;
+    }
+    const shuffled = shuffleArray2(pool);
+    const selected = [shuffled[0], shuffled[1]];
+    const previousSceneId = state.currentPair?.left?.id || state.currentPair?.right?.id;
+    const previousScene = previousSceneId ? state.currentPair?.left?.id === previousSceneId ? state.currentPair?.left : state.currentPair?.right : null;
+    for (let i = 2; i < shuffled.length; i++) {
+      const first = selected[0];
+      const second = selected[1];
+      if (scenesSharePerformer(first, second) || previousScene && scenesSharePerformer(previousScene, second)) {
+        selected[1] = shuffled[i];
+      } else {
+        break;
+      }
+    }
+    selected.forEach((scene) => {
+      trackSceneSelection(scene.id);
+      addToRecentlySelectedScenes(scene.id, 200);
+    });
+    return selected.slice(0, count);
   }
   async function fetchAllScenesSorted() {
     const queryTemplate = `
@@ -7522,7 +8506,6 @@ Match Stats:`;
   }
   async function fetchSwissPairScenes() {
     const sceneFilter = getEffectiveSceneFilter();
-    sceneMetadata = await fetchAllSceneMetadata(sceneFilter);
     const totalScenes = await fetchSceneCount();
     const config = getSceneSelectionConfig(totalScenes);
     let sceneMetadata = state.sceneMetadataCache;
@@ -7532,11 +8515,18 @@ Match Stats:`;
       state.sceneMetadataCache = sceneMetadata;
       state.sceneMetadataRefreshCounter = 0;
     }
-    const eligibleMetadata = sceneMetadata.filter(scenePassesMinDuration);
+    const normalizedMetadata = sceneMetadata.map((scene) => ({
+      ...scene,
+      rating100: scene.rating100 ?? 1
+    }));
+    const eligibleMetadata = normalizedMetadata.filter(scenePassesMinDuration);
     if (eligibleMetadata.length < 2) {
       return { items: await fetchRandomScenes(2), ranks: [null, null] };
     }
-    const avgMatches = calculateAverageMatches(eligibleMetadata.map((scene) => parsePerformerEloData(scene)));
+    const sceneBands = computeSceneRatingBands(eligibleMetadata);
+    const avgMatches = calculateAverageMatches(
+      eligibleMetadata.map((scene) => parsePerformerEloData(scene))
+    );
     const weightedScenes = eligibleMetadata.map((scene) => {
       const stats = parsePerformerEloData(scene);
       const rawMatches = stats.total_matches || 0;
@@ -7545,19 +8535,23 @@ Match Stats:`;
       const baseWeight = Math.pow(recencyWeight, 3) + Math.random() * 0.01;
       const lowMatchBoost = getLowMatchBoost({ ...scene, total_matches: cappedMatches }, avgMatches);
       const distributionBoost = getMatchCountDistributionBoost(scene, eligibleMetadata);
-      const sessionPenalty = getSceneSessionPenalty(scene.id);
-      const finalWeight = baseWeight * lowMatchBoost * distributionBoost * sessionPenalty;
-      return {
-        scene,
-        weight: finalWeight,
-        rating: scene.rating100 || 1,
-        matches: rawMatches,
-        recencyWeight
-      };
+      const finalWeight = baseWeight * lowMatchBoost * distributionBoost;
+      return { scene, weight: finalWeight, rating: scene.rating100 || 1, matches: rawMatches };
     });
     weightedScenes.sort((a, b) => b.weight - a.weight);
-    const seedWeights = weightedScenes.map((item) => item.weight);
-    const seedItem = weightedRandomSelect(weightedScenes, seedWeights) || weightedScenes[0];
+    const isSceneSelectable = (scene, allowHardRepeat = false) => {
+      if (isSceneOnCooldown(scene.id) || isSceneRecentlySelected(scene.id))
+        return false;
+      if (isSceneSessionBlocked(scene.id))
+        return false;
+      if (!allowHardRepeat && isSceneHardExcluded(scene))
+        return false;
+      return true;
+    };
+    const selectableWeightedScenes = weightedScenes.filter((item) => isSceneSelectable(item.scene));
+    const seedPool = selectableWeightedScenes.length >= 2 ? selectableWeightedScenes : weightedScenes;
+    const seedWeights = seedPool.map((item) => item.weight);
+    const seedItem = weightedRandomSelect(seedPool, seedWeights) || seedPool[0];
     const seedSceneMeta = seedItem.scene;
     const seedRating = seedSceneMeta.rating100 || 1;
     const seedMatches = parsePerformerEloData(seedSceneMeta).total_matches || 0;
@@ -7571,26 +8565,15 @@ Match Stats:`;
     } else {
       ratingWindow = config.ratingWindowMax;
     }
-    const isSceneHardExcluded = (scene) => {
-      const stats = parsePerformerEloData(scene);
-      if (!stats.last_match)
-        return false;
-      const lastMatch = new Date(stats.last_match).getTime();
-      if (isNaN(lastMatch))
-        return false;
-      const hoursSince = (Date.now() - lastMatch) / (1e3 * 60 * 60);
-      return hoursSince < config.hardRepeatWindowHours;
-    };
     function filterCandidates(pool, window2, allowHardRepeat = false) {
-      return pool.filter((item) => {
+      const base = pool.filter((item) => {
         if (item.scene.id === seedSceneMeta.id)
           return false;
-        if (isSceneOnCooldown(item.scene.id) || isSceneRecentlySelected(item.scene.id))
-          return false;
-        if (!allowHardRepeat && isSceneHardExcluded(item.scene))
+        if (!isSceneSelectable(item.scene, allowHardRepeat))
           return false;
         return Math.abs(seedRating - item.rating) <= window2;
       });
+      return widenBandWindowUntilMinimum(base, seedSceneMeta, sceneBands, totalScenes);
     }
     let candidates = filterCandidates(weightedScenes, ratingWindow);
     if (candidates.length < 10) {
@@ -7630,6 +8613,7 @@ Match Stats:`;
           return false;
         return Math.abs(seedRating - item.rating) <= ratingWindow * 3;
       });
+      candidates = widenBandWindowUntilMinimum(candidates, seedSceneMeta, sceneBands, totalScenes);
     }
     if (candidates.length === 0) {
       const fallback = weightedScenes.find((item) => item.scene.id !== seedSceneMeta.id);
@@ -7637,73 +8621,101 @@ Match Stats:`;
       console.warn("[Ascension] Scene opponent selection fell back to last-resort");
     }
     candidates.sort((a, b) => b.weight - a.weight);
-    const topCandidates = candidates.slice(0, 20);
+    const topCandidates = candidates.slice(0, Math.min(candidates.length, 60));
     const candidateIds = [seedSceneMeta.id, ...topCandidates.map((c) => c.scene.id)];
     const fullScenes = await fetchScenesByIds(candidateIds);
     const seedFull = fullScenes.find((s) => s.id === seedSceneMeta.id) || seedSceneMeta;
     const candidatesWithSimilarity = topCandidates.map((item) => {
       const full = fullScenes.find((s) => s.id === item.scene.id);
       if (!full)
-        return { ...item, similarity: 0 };
+        return { ...item, similarity: 1, isTooSimilar: true };
       const similarity = calculateSceneSimilarity(seedFull, full);
-      const similarityPenalty = Math.max(config.maxSimilarityPenalty, 1 - similarity * config.similarityPenalty);
+      let similarityPenalty;
+      if (similarity >= config.similarityHardThreshold) {
+        similarityPenalty = 0;
+      } else if (similarity >= config.similaritySoftThreshold) {
+        similarityPenalty = Math.max(0.05, 1 - similarity * 1.5);
+      } else {
+        similarityPenalty = Math.max(config.maxSimilarityPenalty, 1 - similarity * config.similarityPenalty);
+      }
       return {
         ...item,
         weight: item.weight * similarityPenalty,
-        similarity
+        similarity,
+        isTooSimilar: similarity >= config.similarityHardThreshold
       };
-    });
+    }).filter((c) => !c.isTooSimilar);
+    if (candidatesWithSimilarity.length === 0) {
+      const fallbackCandidates = topCandidates.map((item) => {
+        const full = fullScenes.find((s) => s.id === item.scene.id);
+        if (!full)
+          return { ...item, similarity: 1 };
+        const similarity = calculateSceneSimilarity(seedFull, full);
+        return { ...item, weight: item.weight, similarity };
+      }).sort((a, b) => (a.similarity ?? 1) - (b.similarity ?? 1)).slice(0, Math.max(1, Math.ceil(topCandidates.length / 2)));
+      candidatesWithSimilarity.push(...fallbackCandidates);
+    }
+    const previousSceneId = state.currentPair?.left?.id || state.currentPair?.right?.id;
+    const previousScene = previousSceneId ? fullScenes.find((s) => s.id === previousSceneId) || state.currentPair?.left || state.currentPair?.right : null;
+    if (previousScene) {
+      for (const candidate of candidatesWithSimilarity) {
+        const full = fullScenes.find((s) => s.id === candidate.scene.id) || candidate.scene;
+        if (scenesSharePerformer(previousScene, full)) {
+          candidate.weight *= 0.05;
+        }
+      }
+    }
     const opponentWeights = candidatesWithSimilarity.map((c) => c.weight);
     const opponentItem = weightedRandomSelect(candidatesWithSimilarity, opponentWeights);
     const opponentSceneMeta = opponentItem ? opponentItem.scene : candidatesWithSimilarity[0].scene;
     const seedScene = fullScenes.find((s) => s.id === seedSceneMeta.id) || seedSceneMeta;
     const opponentScene = fullScenes.find((s) => s.id === opponentSceneMeta.id) || opponentSceneMeta;
+    const finalSimilarity = calculateSceneSimilarity(seedScene, opponentScene);
+    if (finalSimilarity >= config.similarityHardThreshold && candidatesWithSimilarity.length > 1) {
+      const betterCandidate = candidatesWithSimilarity.filter((c) => c.scene.id !== opponentScene.id).sort((a, b) => (a.similarity ?? 1) - (b.similarity ?? 1))[0];
+      if (betterCandidate) {
+        const betterScene = fullScenes.find((s) => s.id === betterCandidate.scene.id) || betterCandidate.scene;
+        console.warn(`[Ascension] Final scene pair too similar (${finalSimilarity.toFixed(2)}); switching opponent to less similar scene`);
+        trackSceneSelection(betterScene.id);
+        addToRecentlySelectedScenes(betterScene.id, config.recentCooldownSize);
+        return { items: [seedScene, betterScene], ranks: [null, null] };
+      }
+    }
     trackSceneSelection(seedScene.id);
     trackSceneSelection(opponentScene.id);
     addToRecentlySelectedScenes(seedScene.id, config.recentCooldownSize);
     addToRecentlySelectedScenes(opponentScene.id, config.recentCooldownSize);
     return { items: [seedScene, opponentScene], ranks: [null, null] };
   }
-  async function fetchSceneCount() {
-    const sceneFilter = getEffectiveSceneFilter();
-    const variables = {};
-    if (sceneFilter)
-      variables.scene_filter = sceneFilter;
-    const result = await graphqlQuery(`
-    query FindSceneCount($scene_filter: SceneFilterType) {
-      findScenes(scene_filter: $scene_filter, filter: { per_page: 0 }) { count }
-    }
-  `, variables);
-    return result.findScenes.count;
-  }
   async function fetchGauntletPairScenes() {
     const sceneFilter = getEffectiveSceneFilter();
     const variables = { filter: { per_page: -1, sort: "rating100", direction: "DESC" } };
     if (sceneFilter)
       variables.scene_filter = sceneFilter;
-    const result = await graphqlQuery(`
+    const queryResult = await graphqlQuery(`
     query FindScenesByRating($filter: FindFilterType, $scene_filter: SceneFilterType) {
       findScenes(filter: $filter, scene_filter: $scene_filter) { scenes { ${SCENE_FRAGMENT} } }
     }
   `, variables);
-    const allScenes = result.findScenes.scenes || [];
+    const allScenes = queryResult.findScenes.scenes || [];
     const scenes = allScenes.filter(scenePassesMinDuration);
     state.totalItemsCount = scenes.length;
     if (scenes.length < 2)
       return { items: await fetchRandomScenes(2), ranks: [null, null], isVictory: false };
-    return handleMatchmakingLogic(scenes, "scenes");
+    const pairResult = handleMatchmakingLogic(scenes, "scenes");
+    return await postProcessSceneGauntletPair(pairResult, scenes);
   }
   async function fetchChampionPairScenes() {
     const sceneFilter = getEffectiveSceneFilter();
     const variables = { filter: { per_page: -1, sort: "rating100", direction: "DESC" } };
     if (sceneFilter)
       variables.scene_filter = sceneFilter;
-    const result = await graphqlQuery(`
+    const queryResult = await graphqlQuery(`
     query FindScenesByRating($filter: FindFilterType, $scene_filter: SceneFilterType) {
       findScenes(filter: $filter, scene_filter: $scene_filter) { scenes { ${SCENE_FRAGMENT} } }
     }
   `, variables);
-    const allScenes = result.findScenes.scenes || [];
+    const allScenes = queryResult.findScenes.scenes || [];
     const scenes = allScenes.filter(scenePassesMinDuration);
     state.totalItemsCount = scenes.length;
     if (scenes.length < 2)
@@ -7712,7 +8724,8 @@ Match Stats:`;
       const shuffled = [...scenes].sort(() => Math.random() - 0.5);
       return { items: [shuffled[0], shuffled[1]], ranks: [null, null] };
     }
-    return handleMatchmakingLogic(scenes, "scenes");
+    const pairResult = handleMatchmakingLogic(scenes, "scenes");
+    return await postProcessSceneGauntletPair(pairResult, scenes);
   }
   function canBattleByTier(tier1, tier2) {
     const restrictedTiers = ["S-Tier", "A-Tier"];
@@ -7764,19 +8777,6 @@ Match Stats:`;
       state.recentlySelectedScenes.shift();
     }
   }
-  function getSceneSessionPenalty(sceneId) {
-    if (!state.sessionSceneCounts) {
-      state.sessionSceneCounts = {};
-    }
-    const count = state.sessionSceneCounts[sceneId] || 0;
-    if (count > 2)
-      return 0.1;
-    if (count > 1)
-      return 0.3;
-    if (count > 0)
-      return 0.6;
-    return 1;
-  }
   function trackSceneSelection(sceneId) {
     if (!state.sessionSceneCounts) {
       state.sessionSceneCounts = {};
@@ -7790,6 +8790,58 @@ Match Stats:`;
         delete state.sessionSceneCounts[sortedByCount[i]];
       }
     }
+  }
+  function scenesSharePerformer(sceneA, sceneB) {
+    const performersA = new Set((sceneA.performers || []).map((p) => p?.id).filter(Boolean));
+    const performersB = new Set((sceneB.performers || []).map((p) => p?.id).filter(Boolean));
+    if (performersA.size === 0 || performersB.size === 0)
+      return false;
+    for (const id of performersA) {
+      if (performersB.has(id))
+        return true;
+    }
+    return false;
+  }
+  function isSceneSessionBlocked(sceneId) {
+    if (!state.sessionSceneCounts)
+      return false;
+    const count = state.sessionSceneCounts[sceneId] || 0;
+    return count >= 3;
+  }
+  async function postProcessSceneGauntletPair(result, allScenes) {
+    if (!result.items || result.items.length !== 2 || result.isVictory || result.isPlacement) {
+      return result;
+    }
+    const [seedScene, opponentScene] = result.items;
+    const config = getSceneSelectionConfig(allScenes.length);
+    const initialSimilarity = calculateSceneSimilarity(seedScene, opponentScene);
+    if (initialSimilarity < config.similarityHardThreshold)
+      return result;
+    const fullScenes = await fetchScenesByIds([seedScene.id, opponentScene.id]);
+    const seedFull = fullScenes.find((s) => s.id === seedScene.id) || seedScene;
+    const opponentFull = fullScenes.find((s) => s.id === opponentScene.id) || opponentScene;
+    const fullSimilarity = calculateSceneSimilarity(seedFull, opponentFull);
+    if (fullSimilarity < config.similarityHardThreshold)
+      return result;
+    const candidateIds = allScenes.filter((s) => s.id !== seedScene.id && !state.gauntletDefeated.includes(s.id) && !state.skippedIds.includes(s.id)).slice(0, 40).map((s) => s.id);
+    if (candidateIds.length === 0)
+      return result;
+    const candidateFullScenes = await fetchScenesByIds(candidateIds);
+    const better = candidateFullScenes.map((full) => ({ full, sim: calculateSceneSimilarity(seedFull, full) })).filter(({ sim }) => sim < config.similarityHardThreshold).sort((a, b) => a.sim - b.sim)[0];
+    if (better) {
+      const seedRank = allScenes.findIndex((s) => s.id === seedScene.id) + 1;
+      const betterRank = allScenes.findIndex((s) => s.id === better.full.id) + 1;
+      return { items: [seedScene, better.full], ranks: [seedRank, betterRank], isVictory: false };
+    }
+    return result;
+  }
+  function shuffleArray2(array) {
+    const newArray = [...array];
+    for (let i = newArray.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
+    }
+    return newArray;
   }
   function getTierFilteredPerformers(allPerformers, focusTier, tierPool) {
     if (focusTier === "any")
@@ -8625,7 +9677,7 @@ Match Stats:`;
     const pairKey = [id1, id2].sort().join("-");
     return state.seenPairs.has(pairKey);
   }
-  var MAX_SEEN_PAIRS, MAX_SKIPPED_IDS, MAX_SESSION_MATCH_COUNTS, MAX_SESSION_SCENE_COUNTS, TIER_ORDER, RECENT_PERFORMER_COOLDOWN;
+  var MAX_SEEN_PAIRS, MAX_SKIPPED_IDS, MAX_SESSION_MATCH_COUNTS, MAX_SESSION_SCENE_COUNTS, SCENE_RECENT_COOLDOWN_MS, SCENE_SESSION_COOLDOWN_MS, SCENE_RECENT_LS_KEY, SCENE_SESSION_LS_KEY, TIER_ORDER, RECENT_PERFORMER_COOLDOWN;
   var init_battle_engine = __esm({
     "battle-engine.js"() {
       init_api_client();
@@ -8638,24 +9690,22 @@ Match Stats:`;
       init_ui_swipe();
       init_rating_utils();
       init_ui_sidebar();
+      init_scene_handler();
       MAX_SEEN_PAIRS = 500;
       MAX_SKIPPED_IDS = 100;
       MAX_SESSION_MATCH_COUNTS = 500;
       MAX_SESSION_SCENE_COUNTS = 1e3;
+      SCENE_RECENT_COOLDOWN_MS = 8 * 60 * 60 * 1e3;
+      SCENE_SESSION_COOLDOWN_MS = 8 * 60 * 60 * 1e3;
+      SCENE_RECENT_LS_KEY = "hon_recently_selected_scenes";
+      SCENE_SESSION_LS_KEY = "hon_session_scene_counts";
+      loadSceneCooldownState();
       TIER_ORDER = ["S-Tier", "A-Tier", "B-Tier", "C-Tier", "D-Tier", "F-Tier"];
       RECENT_PERFORMER_COOLDOWN = 50;
     }
   });
 
   // ui-dashboard.js
-  var ui_dashboard_exports = {};
-  __export(ui_dashboard_exports, {
-    attachEventListeners: () => attachEventListeners,
-    createMainUI: () => createMainUI,
-    handleGenderToggle: () => handleGenderToggle,
-    setMode: () => setMode,
-    updateSkipButtonVisibility: () => updateSkipButtonVisibility
-  });
   function createSkeletonHTML(count, extraClass = "") {
     const cards = Array.from({ length: count }, () => `
     <div class="hon-skeleton-card">
@@ -8668,25 +9718,11 @@ Match Stats:`;
   }
   function createMainUI() {
     const isPerformers = state.battleType === "performers";
-    const genderFilterHTML = isPerformers ? `
-    <div class="hon-gender-filter">
-      <div class="hon-gender-btns">
-        ${ALL_GENDERS.map((g) => `
-          <button
-            class="hon-gender-btn ${state.selectedGenders.includes(g.value) ? "active" : ""}"
-            data-gender="${g.value}"
-          >
-            ${g.label}
-          </button>`).join("")}
-      </div>
-    </div>` : "";
     return `
     <div id="hotornot-container" class="hon-container">
       <div class="hon-header">
         <h1 class="hon-title">Ascension</h1>
-
-        ${genderFilterHTML}
-        ${isPerformers ? `<button id="hon-stats-btn" class="btn btn-primary">\u{1F4CA} View All Stats</button>` : ""}
+        ${isPerformers ? `<button id="hon-stats-btn" class="btn btn-primary">\u{1F4CA} Performer Statistics</button>` : ""}
       </div>
       <div id="hon-performer-selection" style="display: none;">
         <div id="hon-performer-list">${createSkeletonHTML(6)}</div>
@@ -8695,8 +9731,8 @@ Match Stats:`;
         <div id="hon-comparison-area">${createSkeletonHTML(2, "hon-comparison-skeleton")}</div>
         <div class="hon-actions">
           <div class="hon-action-buttons">
-            <button id="hon-skip-btn" class="hon-action-btn" title="Skip">\u23ED\uFE0F</button>
-            <button id="hon-undo-btn" class="hon-action-btn" title="">\u21A9</button>
+            <button id="hon-skip-btn" class="hon-action-btn" title="Skip Match">Skip Match</button>
+            <button id="hon-undo-btn" class="hon-action-btn" title="Undo Match">Undo Match</button>
           </div>
         </div>
         <div class="hon-keyboard-hints">
@@ -8714,7 +9750,50 @@ Match Stats:`;
     if (!skipBtn)
       return;
     const isSkippableMode = state.currentMode === "swiss" || state.currentMode === "scenes" || state.currentMode === "gauntlet" || state.currentMode === "champion";
-    skipBtn.style.display = isSkippableMode ? "inline-block" : "none";
+    skipBtn.style.display = isSkippableMode ? "" : "none";
+  }
+  function crossfadePanels(showSelection, onEnter = null) {
+    const selectionContainer = document.getElementById("hon-performer-selection");
+    const comparisonArea = document.getElementById("hon-comparison-area");
+    const actionsEl = document.querySelector(".hon-actions");
+    if (!selectionContainer || !comparisonArea)
+      return;
+    const selectionVisible = selectionContainer.style.display !== "none";
+    if (selectionVisible === showSelection) {
+      selectionContainer.style.display = showSelection ? "block" : "none";
+      comparisonArea.style.display = showSelection ? "none" : "";
+      if (actionsEl)
+        actionsEl.style.display = showSelection ? "none" : "";
+      if (onEnter)
+        onEnter();
+      return;
+    }
+    const leaving = showSelection ? comparisonArea : selectionContainer;
+    const entering = showSelection ? selectionContainer : comparisonArea;
+    leaving.classList.add("hon-panel-fading-out");
+    if (actionsEl)
+      actionsEl.classList.add("hon-panel-fading-out");
+    setTimeout(() => {
+      leaving.classList.remove("hon-panel-fading-out");
+      if (actionsEl)
+        actionsEl.classList.remove("hon-panel-fading-out");
+      leaving.style.display = "none";
+      entering.style.display = showSelection ? "block" : "";
+      if (actionsEl)
+        actionsEl.style.display = showSelection ? "none" : "";
+      entering.classList.add("hon-panel-fading-in");
+      if (actionsEl && !showSelection)
+        actionsEl.classList.add("hon-panel-fading-in");
+      requestAnimationFrame(() => {
+        setTimeout(() => {
+          entering.classList.remove("hon-panel-fading-in");
+          if (actionsEl)
+            actionsEl.classList.remove("hon-panel-fading-in");
+        }, 220);
+      });
+      if (onEnter)
+        onEnter();
+    }, 180);
   }
   function attachEventListeners(parent = document) {
     if (!attachedElements.has(parent)) {
@@ -8723,9 +9802,7 @@ Match Stats:`;
     const attachedSet = attachedElements.get(parent);
     const statsBtn = parent.querySelector("#hon-stats-btn");
     if (statsBtn && !attachedSet.has("statsBtn")) {
-      const handler = () => {
-        Promise.resolve().then(() => (init_ui_stats(), ui_stats_exports)).then((m) => m.openStatsModal());
-      };
+      const handler = () => Promise.resolve().then(() => (init_ui_stats(), ui_stats_exports)).then((m) => m.openStatsModal());
       statsBtn.addEventListener("click", handler);
       attachedSet.add("statsBtn");
     }
@@ -8741,13 +9818,12 @@ Match Stats:`;
     const skipBtn = parent.querySelector("#hon-skip-btn");
     if (skipBtn && !attachedSet.has("skipBtn")) {
       updateSkipButtonVisibility();
-      const handler = async (e) => {
+      const handler = (e) => {
         e.preventDefault();
         e.stopPropagation();
         const isSkippableMode = state.currentMode === "swiss" || state.currentMode === "scenes" || state.currentMode === "gauntlet" || state.currentMode === "champion";
         if (isSkippableMode) {
-          const { handleSkip: handleSkip2 } = await Promise.resolve().then(() => (init_match_handler(), match_handler_exports));
-          handleSkip2();
+          handleSkip();
         }
       };
       skipBtn.addEventListener("click", handler);
@@ -8755,20 +9831,21 @@ Match Stats:`;
     }
     const undoBtn = parent.querySelector("#hon-undo-btn");
     if (undoBtn && !attachedSet.has("undoBtn")) {
-      const handler = () => handleUndo();
+      const handler = async () => {
+        undoBtn.classList.add("hon-action-loading");
+        const originalText = undoBtn.textContent;
+        undoBtn.textContent = "Undoing...";
+        try {
+          await handleUndo();
+        } finally {
+          undoBtn.classList.remove("hon-action-loading");
+          undoBtn.textContent = originalText;
+        }
+      };
       undoBtn.onclick = handler;
-      undoBtn.style.display = state.matchHistory && state.matchHistory.length > 0 ? "inline-block" : "none";
+      undoBtn.style.display = state.matchHistory && state.matchHistory.length > 0 ? "" : "none";
       attachedSet.add("undoBtn");
     }
-    const genderButtons = parent.querySelectorAll(".hon-gender-btn");
-    genderButtons.forEach((btn, index) => {
-      const key = `gender-${index}`;
-      if (!attachedSet.has(key)) {
-        const handler = () => handleGenderToggle(btn.dataset.gender);
-        btn.addEventListener("click", handler);
-        attachedSet.add(key);
-      }
-    });
     const modeButtons = parent.querySelectorAll(".hon-mode-btn");
     modeButtons.forEach((btn, index) => {
       const key = `mode-${index}`;
@@ -8790,25 +9867,10 @@ Match Stats:`;
             modal.classList.remove("hon-mode-champion", "hon-mode-swiss", "hon-mode-gauntlet", "hon-mode-placement");
             modal.classList.add(`hon-mode-${rawMode}`);
           }
-          const selectionContainer = document.getElementById("hon-performer-selection");
-          const comparisonArea = document.getElementById("hon-comparison-area");
-          const actionsEl = document.querySelector(".hon-actions");
           if (newMode === "swiss") {
-            if (selectionContainer)
-              selectionContainer.style.display = "none";
-            if (comparisonArea)
-              comparisonArea.style.display = "";
-            if (actionsEl)
-              actionsEl.style.display = "";
-            loadNewPair();
+            crossfadePanels(false, () => loadNewPair());
           } else if (newMode === "gauntlet" || newMode === "champion") {
-            if (selectionContainer)
-              selectionContainer.style.display = "block";
-            if (comparisonArea)
-              comparisonArea.style.display = "none";
-            if (actionsEl)
-              actionsEl.style.display = "none";
-            Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection());
+            crossfadePanels(true, () => Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection()));
           }
           updateSkipButtonVisibility();
         };
@@ -8817,25 +9879,6 @@ Match Stats:`;
       }
     });
   }
-  function handleGenderToggle(gender) {
-    const isSelected = state.selectedGenders.includes(gender);
-    if (isSelected) {
-      state.selectedGenders = state.selectedGenders.filter((g) => g !== gender);
-    } else {
-      state.selectedGenders.push(gender);
-    }
-    try {
-      localStorage.setItem("hotornot_selected_genders", JSON.stringify(state.selectedGenders));
-    } catch (e) {
-      console.warn("[Ascension] Could not save gender selection to localStorage:", e);
-    }
-    console.log(`[Ascension] Gender Filter Updated: ${state.selectedGenders.join(", ")}`);
-    const genderBtns = document.querySelectorAll(`.hon-gender-btn[data-gender="${gender}"]`);
-    genderBtns.forEach((btn) => {
-      btn.classList.toggle("active", !isSelected);
-    });
-    loadNewPair();
-  }
   function setMode(mode) {
     const rawMode = mode;
     const normalizedMode = rawMode === "placement" ? "gauntlet" : rawMode;
@@ -8843,19 +9886,18 @@ Match Stats:`;
       resetBattleState();
     }
     state.currentMode = normalizedMode;
-    const selEl = document.getElementById("hon-performer-selection");
-    const compEl = document.getElementById("hon-comparison-area");
-    if (selEl)
-      selEl.style.display = "none";
-    if (compEl)
-      compEl.style.display = "none";
     const modal = document.getElementById("hon-modal");
     if (modal) {
       modal.classList.remove("hon-mode-champion", "hon-mode-swiss", "hon-mode-gauntlet", "hon-mode-placement");
       modal.classList.add(`hon-mode-${rawMode}`);
     }
     if (normalizedMode === "gauntlet" || normalizedMode === "champion") {
-      Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection());
+      crossfadePanels(true, () => Promise.resolve().then(() => (init_gauntlet_selection(), gauntlet_selection_exports)).then((m) => m.loadPerformerSelection()));
+    } else {
+      crossfadePanels(false, () => {
+        if (normalizedMode === "swiss")
+          loadNewPair();
+      });
     }
     updateSkipButtonVisibility();
   }
@@ -8863,11 +9905,22 @@ Match Stats:`;
   var init_ui_dashboard = __esm({
     "ui-dashboard.js"() {
       init_state();
-      init_dom_utils();
-      init_constants();
       init_battle_engine();
       init_match_handler();
       attachedElements = /* @__PURE__ */ new WeakMap();
+    }
+  });
+
+  // dom-utils.js
+  function clearDOMCache() {
+    elementCollectionCache.clear();
+    commonElementsCache.clear();
+  }
+  var elementCollectionCache, commonElementsCache;
+  var init_dom_utils = __esm({
+    "dom-utils.js"() {
+      elementCollectionCache = /* @__PURE__ */ new Map();
+      commonElementsCache = /* @__PURE__ */ new Map();
     }
   });
 
@@ -8928,17 +9981,49 @@ Match Stats:`;
       buttonObserver = null;
     }
   }
-  function closeRankingModal() {
+  function finishModalClose() {
     const gameModal = document.getElementById("hon-modal");
     const statsModal = document.getElementById("hon-stats-modal");
-    if (gameModal)
+    if (gameModal && gameModal.classList.contains("hon-modal-opening")) {
+      gameModal.classList.remove("hon-modal-closing");
+      closeAnimationInProgress = false;
+      return;
+    }
+    if (gameModal) {
       gameModal.style.display = "none";
+      gameModal.classList.remove("hon-modal-opening", "hon-modal-closing");
+    }
     if (statsModal)
       statsModal.style.display = "none";
     handleGlobalKeys.deactivate();
     cleanupButtonObserver();
     destroyEventLog();
     clearDOMCache();
+    closeAnimationInProgress = false;
+  }
+  function closeRankingModal() {
+    const gameModal = document.getElementById("hon-modal");
+    const statsModal = document.getElementById("hon-stats-modal");
+    if (statsModal)
+      statsModal.style.display = "none";
+    if (!gameModal || gameModal.style.display === "none" || closeAnimationInProgress) {
+      finishModalClose();
+      return;
+    }
+    closeAnimationInProgress = true;
+    gameModal.classList.remove("hon-modal-opening");
+    gameModal.classList.add("hon-modal-closing");
+    const onAnimationEnd = (e) => {
+      if (!e.target.classList.contains("hon-modal-content"))
+        return;
+      finishModalClose();
+      gameModal.removeEventListener("animationend", onAnimationEnd);
+    };
+    gameModal.addEventListener("animationend", onAnimationEnd);
+    setTimeout(() => {
+      if (closeAnimationInProgress)
+        finishModalClose();
+    }, 400);
   }
   async function _buildAndOpenModal() {
     try {
@@ -8948,13 +10033,12 @@ Match Stats:`;
         modal = document.createElement("div");
         modal.id = "hon-modal";
         modal.className = "hon-modal";
-        const { createSidebar: createSidebar2, attachSidebarEventListeners: attachSidebarEventListeners2 } = await Promise.resolve().then(() => (init_ui_sidebar(), ui_sidebar_exports));
         const { isMobile: isMobile3 } = await Promise.resolve().then(() => (init_ui_swipe(), ui_swipe_exports));
         const mobileCheck = isMobile3();
         const mainUI = `
         <div id="hotornot-container" class="hon-container">
           <div class="hon-plugin-layout ${mobileCheck ? "mobile" : ""}">
-            ${createSidebar2()}
+            ${createSidebar()}
             <div class="hon-main-plugin-content">
               <div class="hon-header"></div>
               <div id="hon-performer-selection" style="display: none;">
@@ -8966,8 +10050,8 @@ Match Stats:`;
                 </div>
                 <div class="hon-actions">
                   <div class="hon-action-buttons">
-                    <button id="hon-skip-btn" class="hon-action-btn" title="Skip">\u23ED\uFE0F</button>
-                    <button id="hon-undo-btn" class="hon-action-btn" title="">\u21A9</button>
+                    <button id="hon-skip-btn" class="hon-action-btn" title="Skip Match">Skip Match</button>
+                    <button id="hon-undo-btn" class="hon-action-btn" title="Undo Match">Undo Match</button>
                   </div>
                 </div>
                 <div class="hon-keyboard-hints">
@@ -8995,7 +10079,6 @@ Match Stats:`;
             flex-direction: column;
             height: 100%;
           }
-          
           .hon-sidebar.mobile {
             order: 2;
             width: 100%;
@@ -9003,31 +10086,23 @@ Match Stats:`;
             overflow-y: auto;
             border-top: 1px solid #444;
           }
-          
           .hon-sidebar.mobile .hon-sidebar-content {
             padding: 10px;
           }
-          
           .hon-sidebar.mobile .hon-sidebar-section {
             margin-bottom: 5px;
           }
-          
           .hon-sidebar.mobile .hon-sidebar-subsection {
             padding: 5px 0;
           }
-          
           .hon-main-plugin-content {
             order: 1;
             flex: 1;
             overflow-y: auto;
           }
-          
-          /* Event log should appear last */
           .hon-event-log-container {
             order: 3;
           }
-          
-          /* Transparent background for mobile modal */
           .hon-modal-content.mobile {
             background: transparent;
             box-shadow: none;
@@ -9038,19 +10113,23 @@ Match Stats:`;
         document.body.appendChild(modal);
         const sidebarContainer = modal.querySelector("#hon-sidebar");
         if (sidebarContainer) {
-          attachSidebarEventListeners2(modal);
+          attachSidebarEventListeners(modal);
         }
-        const { attachEventListeners: attachEventListeners2 } = await Promise.resolve().then(() => (init_ui_dashboard(), ui_dashboard_exports));
-        attachEventListeners2(modal);
+        if (!mobileCheck) {
+          const actionsEl = modal.querySelector(".hon-actions");
+          if (sidebarContainer && actionsEl) {
+            sidebarContainer.appendChild(actionsEl);
+          }
+        }
+        attachEventListeners(modal);
         const closeModalBtn = modal.querySelector(".hon-modal-close");
-        if (closeModalBtn) {
+        if (closeModalBtn)
           closeModalBtn.onclick = () => closeRankingModal();
-        }
         const modalBackdrop = modal.querySelector(".hon-modal-backdrop");
-        if (modalBackdrop) {
+        if (modalBackdrop)
           modalBackdrop.onclick = () => closeRankingModal();
-        }
       }
+      modal.classList.remove("hon-modal-closing");
       modal.style.display = "flex";
       modal.style.alignItems = "center";
       modal.style.justifyContent = "center";
@@ -9059,6 +10138,14 @@ Match Stats:`;
       modal.style.left = "0";
       modal.style.width = "100%";
       modal.style.height = "100%";
+      if (wasModalHidden) {
+        modal.classList.remove("hon-modal-opening");
+        void modal.offsetHeight;
+        modal.classList.add("hon-modal-opening");
+        setTimeout(() => {
+          modal.classList.remove("hon-modal-opening");
+        }, 450);
+      }
       initEventLog();
       state.battleType = state.currentMode === "scenes" ? "scenes" : "performers";
       const modalElement = document.getElementById("hon-modal");
@@ -9067,7 +10154,6 @@ Match Stats:`;
         modalElement.classList.add(`hon-mode-${state.currentMode}`);
       }
       if (wasModalHidden) {
-        const { loadNewPair: loadNewPair2 } = await Promise.resolve().then(() => (init_battle_engine(), battle_engine_exports));
         if (state.currentMode === "gauntlet") {
           if (state.gauntletChampion) {
             const selEl = document.getElementById("hon-performer-selection");
@@ -9079,7 +10165,7 @@ Match Stats:`;
               compEl.style.display = "";
             if (actEl)
               actEl.style.display = "";
-            loadNewPair2();
+            loadNewPair();
           } else {
             window.showPerformerSelection();
           }
@@ -9093,7 +10179,7 @@ Match Stats:`;
             compEl.style.display = "";
           if (actEl)
             actEl.style.display = "";
-          loadNewPair2();
+          loadNewPair();
         }
       }
       handleGlobalKeys.activate();
@@ -9146,7 +10232,7 @@ Match Stats:`;
       console.error("CRASH in openRankingModal:", err);
     }
   }
-  var buttonObserver, handleGlobalKeys;
+  var buttonObserver, closeAnimationInProgress, handleGlobalKeys;
   var init_ui_modal = __esm({
     "ui-modal.js"() {
       init_state();
@@ -9157,6 +10243,7 @@ Match Stats:`;
       init_ui_event_log();
       buttonObserver = null;
       window._honCleanupButtonObserver = cleanupButtonObserver;
+      closeAnimationInProgress = false;
       watchForNavigation();
       ["popstate"].forEach(
         (event) => window.addEventListener(event, () => {
@@ -9193,19 +10280,16 @@ Match Stats:`;
             e.stopImmediatePropagation();
             if (e.key === "ArrowLeft") {
               const leftCard = activeModal.querySelector('.hon-scene-card[data-side="left"] .hon-scene-body');
-              if (leftCard) {
+              if (leftCard)
                 leftCard.click();
-              }
             } else if (e.key === "ArrowRight") {
               const rightCard = activeModal.querySelector('.hon-scene-card[data-side="right"] .hon-scene-body');
-              if (rightCard) {
+              if (rightCard)
                 rightCard.click();
-              }
             } else if (isSpace) {
               const skipBtn = document.getElementById("hon-skip-btn");
-              if (skipBtn) {
+              if (skipBtn)
                 skipBtn.click();
-              }
             }
           }
         }
@@ -9244,7 +10328,6 @@ Match Stats:`;
     createVictoryScreen: () => createVictoryScreen,
     generateBarGroups: () => generateBarGroups,
     generateStatTables: () => generateStatTables,
-    handleGenderToggle: () => handleGenderToggle,
     injectBattleRankBadge: () => injectBattleRankBadge,
     isOnSinglePerformerPage: () => isOnSinglePerformerPage,
     openRankingModal: () => openRankingModal,
@@ -10084,6 +11167,100 @@ Match Stats:`;
       return "#92e014";
     return "#808080";
   }
+  function getTopRatedScene(performer, scenes) {
+    const performerSceneIds = new Set(performer?.scenes || []);
+    const performerScenes = (scenes || []).filter((s) => performerSceneIds.has(s.id));
+    let top = null;
+    performerScenes.forEach((scene) => {
+      if (scene.rating === null || scene.rating === void 0 || isNaN(scene.rating))
+        return;
+      if (!top || scene.rating > top.rating) {
+        top = { id: scene.id, rating: scene.rating };
+      }
+    });
+    return top;
+  }
+  function formatTopSceneLink(scene) {
+    if (!scene || scene.id == null)
+      return "N/A";
+    const origin = window.location.origin;
+    return `<a href="${origin}/scenes/${scene.id}" target="_blank" rel="noopener noreferrer" class="top-scene-link" data-scene-id="${scene.id}" style="color:#14bbe0; text-decoration:underline;">Scene ${scene.id}</a>`;
+  }
+  var scenePreviewTooltip = null;
+  function getScenePreviewTooltip() {
+    if (!scenePreviewTooltip) {
+      scenePreviewTooltip = document.createElement("div");
+      scenePreviewTooltip.className = "scene-preview-tooltip";
+      scenePreviewTooltip.style.position = "fixed";
+      scenePreviewTooltip.style.zIndex = "9999";
+      scenePreviewTooltip.style.width = isMobile2() ? "240px" : "480px";
+      scenePreviewTooltip.style.height = isMobile2() ? "135px" : "270px";
+      scenePreviewTooltip.style.backgroundColor = "#000";
+      scenePreviewTooltip.style.border = "1px solid #555";
+      scenePreviewTooltip.style.borderRadius = "6px";
+      scenePreviewTooltip.style.overflow = "hidden";
+      scenePreviewTooltip.style.display = "none";
+      scenePreviewTooltip.style.pointerEvents = "none";
+      scenePreviewTooltip.style.boxShadow = "0 4px 12px rgba(0,0,0,0.5)";
+      const video = document.createElement("video");
+      video.className = "scene-preview-tooltip-video";
+      video.setAttribute("disableremoteplayback", "");
+      video.setAttribute("playsinline", "");
+      video.autoplay = true;
+      video.muted = true;
+      video.loop = true;
+      video.preload = "none";
+      video.style.width = "100%";
+      video.style.height = "100%";
+      video.style.objectFit = "cover";
+      scenePreviewTooltip.appendChild(video);
+      document.body.appendChild(scenePreviewTooltip);
+    }
+    return scenePreviewTooltip;
+  }
+  function showScenePreview(sceneId, x, y) {
+    const tooltip = getScenePreviewTooltip();
+    const video = tooltip.querySelector("video");
+    const origin = window.location.origin;
+    const tooltipWidth = isMobile2() ? 240 : 480;
+    const tooltipHeight = isMobile2() ? 135 : 270;
+    tooltip.style.width = `${tooltipWidth}px`;
+    tooltip.style.height = `${tooltipHeight}px`;
+    video.src = `${origin}/scene/${sceneId}/preview`;
+    video.load();
+    video.play().catch(() => {
+    });
+    tooltip.style.display = "block";
+    tooltip.style.left = `${Math.min(x + 15, window.innerWidth - tooltipWidth - 15)}px`;
+    tooltip.style.top = `${Math.max(y - tooltipHeight - 15, 10)}px`;
+  }
+  function hideScenePreview() {
+    const tooltip = getScenePreviewTooltip();
+    const video = tooltip.querySelector("video");
+    video.pause();
+    video.src = "";
+    tooltip.style.display = "none";
+  }
+  function updateScenePreviewPosition(x, y) {
+    const tooltip = getScenePreviewTooltip();
+    if (tooltip.style.display === "block") {
+      const tooltipWidth = isMobile2() ? 240 : 480;
+      const tooltipHeight = isMobile2() ? 135 : 270;
+      tooltip.style.left = `${Math.min(x + 15, window.innerWidth - tooltipWidth - 15)}px`;
+      tooltip.style.top = `${Math.max(y - tooltipHeight - 15, 10)}px`;
+    }
+  }
+  function attachScenePreviewHover(container) {
+    container.querySelectorAll(".top-scene-link").forEach((link) => {
+      link.addEventListener("mouseenter", (e) => {
+        showScenePreview(link.dataset.sceneId, e.clientX, e.clientY);
+      });
+      link.addEventListener("mousemove", (e) => {
+        updateScenePreviewPosition(e.clientX, e.clientY);
+      });
+      link.addEventListener("mouseleave", hideScenePreview);
+    });
+  }
   function createPerformerProfile(container, performer, allPerformers, onShowProfile, scenes) {
     const profileContainer = document.createElement("div");
     profileContainer.style.marginTop = "2rem";
@@ -10247,6 +11424,7 @@ Match Stats:`;
     const ascScoreColor = ascScore !== null ? getTierColor2(getRatingTier2(performer, allPerformers)) : "#fff";
     const winRate = getWinRate(performer);
     const winRateColor = parseFloat(winRate) >= 50 ? "#4caf50" : "#f44336";
+    const topScene = getTopRatedScene(performer, scenes || []);
     const statCards = [
       {
         title: ascScoreTitle(performer),
@@ -10288,6 +11466,12 @@ Match Stats:`;
         heading: "Avg Scene Rating",
         tooltip: "Average scene rating (display scale)",
         color: getSceneRatingColor(sceneStats.avgSceneRating)
+      },
+      {
+        title: formatTopSceneLink(topScene),
+        heading: "Top Rated Scene",
+        tooltip: topScene ? `Highest rated scene: ${(topScene.rating / 10).toFixed(1)}` : "No rated scenes available",
+        isHtml: true
       }
     ];
     statCards.forEach((card) => {
@@ -10306,7 +11490,11 @@ Match Stats:`;
       statTitle.style.overflow = "hidden";
       statTitle.style.textOverflow = "ellipsis";
       statTitle.style.whiteSpace = "nowrap";
-      statTitle.innerText = card.title;
+      if (card.isHtml) {
+        statTitle.innerHTML = card.title;
+      } else {
+        statTitle.innerText = card.title;
+      }
       statEl.appendChild(statTitle);
       const statHeading = document.createElement("p");
       statHeading.classList.add("heading");
@@ -10325,6 +11513,7 @@ Match Stats:`;
       statsGrid.appendChild(statEl);
     });
     profileContainer.appendChild(statsGrid);
+    attachScenePreviewHover(statsGrid);
     const record = parsePerformerRecord(performer) || [];
     const matchHistoryContainer = document.createElement("div");
     matchHistoryContainer.style.marginTop = "2rem";
@@ -11138,6 +12327,8 @@ Match Stats:`;
     const avgSceneRatingText = sceneStats.avgSceneRating !== null ? (sceneStats.avgSceneRating / 10).toFixed(1) : "N/A";
     const comparisonSceneStats = comparisonPerformer ? getCachedPerformerSceneStats(comparisonPerformer, scenes || []) : null;
     const comparisonAvgSceneRatingText = comparisonSceneStats ? comparisonSceneStats.avgSceneRating !== null ? (comparisonSceneStats.avgSceneRating / 10).toFixed(1) : "N/A" : null;
+    const topScene = getTopRatedScene(performer, scenes || []);
+    const comparisonTopScene = comparisonPerformer ? getTopRatedScene(comparisonPerformer, scenes || []) : null;
     const statCards = [
       {
         title: ascScoreTitle(performer),
@@ -11218,6 +12409,14 @@ Match Stats:`;
         tooltip: "Average scene rating (display scale)",
         color: getSceneRatingColor(sceneStats.avgSceneRating),
         comparisonValue: comparisonAvgSceneRatingText
+      },
+      {
+        title: formatTopSceneLink(topScene),
+        heading: "Top Rated Scene",
+        tooltip: topScene ? `Highest rated scene: ${(topScene.rating / 10).toFixed(1)}` : "No rated scenes available",
+        isHtml: true,
+        skipDiff: true,
+        comparisonValue: comparisonPerformer ? formatTopSceneLink(comparisonTopScene) : null
       }
     ];
     statCards.forEach((cardData) => {
@@ -11232,7 +12431,7 @@ Match Stats:`;
       statTitle.style.marginBottom = "0.25rem";
       statTitle.style.color = cardData.color || "#fff";
       statTitle.style.fontWeight = cardData.color ? "bold" : "normal";
-      if (cardData.comparisonValue !== null && cardData.comparisonValue !== void 0) {
+      if (!cardData.skipDiff && cardData.comparisonValue !== null && cardData.comparisonValue !== void 0) {
         const currentValue = cardData.title;
         const comparisonValue = cardData.comparisonValue;
         if (!isNaN(currentValue) && !isNaN(comparisonValue) && currentValue !== "N/A" && comparisonValue !== "N/A") {
@@ -11253,7 +12452,11 @@ Match Stats:`;
           statTitle.innerText = currentValue;
         }
       } else {
-        statTitle.innerText = cardData.title;
+        if (cardData.isHtml) {
+          statTitle.innerHTML = cardData.title;
+        } else {
+          statTitle.innerText = cardData.title;
+        }
       }
       statEl.appendChild(statTitle);
       const statHeading = document.createElement("p");
@@ -11269,6 +12472,7 @@ Match Stats:`;
       statsGrid.appendChild(statEl);
     });
     card.appendChild(statsGrid);
+    attachScenePreviewHover(statsGrid);
     const viewProfileButton = document.createElement("button");
     viewProfileButton.innerText = "View Full Profile";
     viewProfileButton.style.padding = "0.5rem 1rem";
@@ -12123,8 +13327,8 @@ Match Stats:`;
     tierIndicator.style.justifyContent = "center";
     tierIndicator.style.gap = "2px";
     container.appendChild(tierIndicator);
-    const normalDelay = 5e3;
-    const firstViewDelay = 1500;
+    const normalDelay = 8e3;
+    const firstViewDelay = 5e3;
     function startAutoTransition(delay = normalDelay) {
       clearActiveCarouselInterval();
       activeCarouselInterval = setInterval(() => {
@@ -12673,7 +13877,6 @@ Match Stats:`;
   window.openRankingModal = openRankingModal;
   window.openStatsModal = openStatsModal;
   window.closeRankingModal = closeRankingModal;
-  window.handleGenderToggle = handleGenderToggle;
   window.showPerformerSelection = showPerformerSelection;
   window.handleChooseItem = handleChooseItem;
   var lastPath2 = "";
