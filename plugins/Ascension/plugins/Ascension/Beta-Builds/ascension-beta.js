@@ -1764,19 +1764,21 @@
     }
     return fresh;
   }
-  async function fetchPerformerExtraImages(performerId) {
+  async function fetchPerformerExtraImages(performerId, mobileLayout = false) {
     const pool = await ensureGalleryPool(performerId);
     let freshL = await getFreeBucket(pool, performerId, "Landscape");
     let freshP = await getFreeBucket(pool, performerId, "Portrait");
-    const canL = freshL.length >= 1;
-    const canP = freshP.length >= 2;
+    const landscapeCountNeeded = mobileLayout ? 2 : 1;
+    const portraitCountNeeded = mobileLayout ? 1 : 2;
+    const canL = freshL.length >= landscapeCountNeeded;
+    const canP = freshP.length >= portraitCountNeeded;
     if (!canL && !canP) {
       pool.seen.clear();
       freshL = await getFreeBucket(pool, performerId, "Landscape");
       freshP = await getFreeBucket(pool, performerId, "Portrait");
     }
-    const canL2 = freshL.length >= 1;
-    const canP2 = freshP.length >= 2;
+    const canL2 = freshL.length >= landscapeCountNeeded;
+    const canP2 = freshP.length >= portraitCountNeeded;
     const canP1 = freshP.length >= 1;
     let useLandscape = false;
     if (canL2 && canP2) {
@@ -1792,13 +1794,25 @@
     }
     let selected = [];
     if (useLandscape) {
-      selected = [freshL[Math.floor(Math.random() * freshL.length)]];
+      if (mobileLayout && freshL.length >= 2) {
+        const firstIndex = Math.floor(Math.random() * freshL.length);
+        let secondIndex = Math.floor(Math.random() * (freshL.length - 1));
+        if (secondIndex >= firstIndex)
+          secondIndex += 1;
+        selected = [freshL[firstIndex], freshL[secondIndex]];
+      } else {
+        selected = [freshL[Math.floor(Math.random() * freshL.length)]];
+      }
     } else if (freshP.length >= 2) {
-      const idx1 = Math.floor(Math.random() * freshP.length);
-      let idx2 = Math.floor(Math.random() * (freshP.length - 1));
-      if (idx2 >= idx1)
-        idx2 += 1;
-      selected = [freshP[idx1], freshP[idx2]];
+      if (mobileLayout) {
+        selected = [freshP[Math.floor(Math.random() * freshP.length)]];
+      } else {
+        const idx1 = Math.floor(Math.random() * freshP.length);
+        let idx2 = Math.floor(Math.random() * (freshP.length - 1));
+        if (idx2 >= idx1)
+          idx2 += 1;
+        selected = [freshP[idx1], freshP[idx2]];
+      }
     } else {
       selected = [freshP[0]];
     }
@@ -1811,18 +1825,20 @@
       thumbnails: selected,
       single: useLandscape || selected.length === 1,
       lonePortrait,
+      landscapePair: mobileLayout && useLandscape && selected.length === 2,
       hasMore
     };
   }
   function buildGalleryExtrasHtml(extraData, performerId) {
-    const { thumbnails = [], single = false, lonePortrait = false, hasMore = false } = extraData || {};
+    const { thumbnails = [], single = false, lonePortrait = false, landscapePair = false, hasMore = false } = extraData || {};
     const sliceClass = single ? " hon-gallery-single" : "";
     const lonePortraitClass = lonePortrait ? " hon-gallery-lone-portrait" : "";
+    const landscapePairClass = landscapePair ? " hon-gallery-landscape-pair" : "";
     const imgs = thumbnails.map((src) => `<img class="hon-gallery-extra-img" src="${src}" loading="lazy" alt="" />`).join("\n      ");
     const isMobileSingleRefresh = window.innerWidth < 1201 && getCardDisplayOption2("DisplayExtraImages", false);
-    const refreshBtn = hasMore || isMobileSingleRefresh ? `<button class="hon-gallery-refresh-btn" title="Refresh images" type="button">\u21BA</button>` : "";
+    const refreshBtn = hasMore || isMobileSingleRefresh ? `<button class="hon-gallery-refresh-btn" title="${hasMore ? "Refresh images" : "Show extra images"}" type="button">\u21BA</button>` : "";
     return `
-      <div class="hon-image-gallery-extras${sliceClass}${lonePortraitClass}" data-performer-id="${performerId}">
+      <div class="hon-image-gallery-extras${sliceClass}${lonePortraitClass}${landscapePairClass}" data-performer-id="${performerId}">
         ${imgs}
         ${refreshBtn}
       </div>`;
@@ -1833,6 +1849,8 @@
     root.querySelectorAll(".hon-gallery-refresh-btn").forEach((btn) => {
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
+        if (btn.disabled)
+          return;
         const extrasEl = btn.closest(".hon-image-gallery-extras");
         if (!extrasEl)
           return;
@@ -1842,7 +1860,7 @@
         const isMobileSingleRefresh = window.innerWidth < 1201 && getCardDisplayOption2("DisplayExtraImages", false);
         btn.disabled = true;
         btn.textContent = "\u231B";
-        const data = await fetchPerformerExtraImages(performerId);
+        const data = await fetchPerformerExtraImages(performerId, isMobileSingleRefresh);
         if (isMobileSingleRefresh) {
           const galleryRoot = extrasEl.closest(".hon-mobile-refresh-gallery");
           if (galleryRoot) {
@@ -1851,6 +1869,19 @@
           extrasEl.classList.add("hon-mobile-active");
           extrasEl.classList.toggle("hon-gallery-single", data.single);
           extrasEl.classList.toggle("hon-gallery-lone-portrait", data.lonePortrait);
+          extrasEl.classList.toggle("hon-gallery-landscape-pair", data.landscapePair);
+          const refreshButtons = Array.from(extrasEl.querySelectorAll(".hon-gallery-refresh-btn"));
+          const refreshBtn = refreshButtons.shift() || null;
+          refreshButtons.forEach((duplicate) => duplicate.remove());
+          if (data.thumbnails.length === 0) {
+            if (data.hasMore && refreshBtn) {
+              refreshBtn.disabled = false;
+              refreshBtn.textContent = "\u21BA";
+            } else {
+              refreshBtn?.remove();
+            }
+            return;
+          }
           extrasEl.querySelectorAll(".hon-gallery-extra-img").forEach((el) => el.remove());
           data.thumbnails.forEach((src) => {
             const img = document.createElement("img");
@@ -1858,10 +1889,19 @@
             img.src = src;
             img.loading = "lazy";
             img.alt = "";
-            extrasEl.appendChild(img);
+            extrasEl.insertBefore(img, extrasEl.querySelector(".hon-gallery-refresh-btn"));
           });
-          const refreshBtn = extrasEl.querySelector(".hon-gallery-refresh-btn");
-          if (refreshBtn) {
+          if (data.hasMore && !refreshBtn) {
+            const newBtn = document.createElement("button");
+            newBtn.type = "button";
+            newBtn.className = "hon-gallery-refresh-btn";
+            newBtn.title = "Refresh images";
+            newBtn.textContent = "\u21BA";
+            extrasEl.appendChild(newBtn);
+            attachGalleryRefreshHandlers(extrasEl);
+          } else if (!data.hasMore && refreshBtn) {
+            refreshBtn.remove();
+          } else if (refreshBtn) {
             refreshBtn.disabled = false;
             refreshBtn.textContent = "\u21BA";
           }
@@ -8582,9 +8622,10 @@ Match Stats:`;
       let leftExtraImages = null;
       let rightExtraImages = null;
       if (state.battleType === "performers" && (shouldDisplayExtraImages() || shouldEnableMobileExtraImageRefresh())) {
+        const mobileGallery = shouldEnableMobileExtraImageRefresh();
         [leftExtraImages, rightExtraImages] = await Promise.all([
-          fetchPerformerExtraImages(left.id),
-          fetchPerformerExtraImages(right.id)
+          fetchPerformerExtraImages(left.id, mobileGallery),
+          fetchPerformerExtraImages(right.id, mobileGallery)
         ]);
       }
       state.currentPair.leftExtraImages = leftExtraImages;
