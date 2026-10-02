@@ -6602,4 +6602,90 @@
   }
 }
 
+#hon-modal.hon-compact-mode .hon-modal-content {
+  width: 100vw !important;
+  max-width: 100vw !important;
+  height: 100vh !important;
+  max-height: 100vh !important;
+  border-radius: 0 !important;
+  background: #111 !important;
+}
+
+#hon-modal.hon-compact-mode .hon-container {
+  width: 100% !important;
+  max-width: none !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 6px !important;
+  border-radius: 0 !important;
+}
+
+#hon-modal.hon-compact-mode .hon-plugin-layout {
+  min-height: 0 !important;
+  gap: 6px !important;
+}
+
+#hon-modal.hon-compact-mode .hon-sidebar {
+  margin-bottom: 4px !important;
+  padding: 6px 0 !important;
+}
+
+#hon-modal.hon-compact-mode .hon-sidebar-section {
+  margin-bottom: 6px !important;
+  padding-bottom: 6px !important;
+}
+
+#hon-modal.hon-compact-mode .hon-sidebar-row {
+  margin: 0 4px !important;
+  padding: 6px 8px !important;
+}
+
+#hon-modal.hon-compact-mode .hon-sidebar-subrow {
+  margin: 1px 0 !important;
+  padding: 4px 8px !important;
+}
+
+#hon-modal.hon-compact-mode .hon-sidebar-subsection {
+  margin: 4px 0 !important;
+  padding-left: 6px !important;
+}
+
+#hon-modal.hon-compact-mode #hon-comparison-area {
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+#hon-modal.hon-compact-mode #hon-comparison-area:empty::before,
+#hon-modal.hon-compact-mode #hon-comparison-area .hon-loading {
+  min-height: 0 !important;
+}
+
+#hon-modal.hon-compact-mode .hon-actions {
+  padding: 4px 0 !important;
+}
+
+#hon-modal.hon-compact-mode .hon-keyboard-hints {
+  gap: 8px !important;
+  margin-top: 4px !important;
+}
+
+@media (min-width: 1201px) {
+  #hon-modal.hon-compact-mode .hon-vs-container {
+    width: 100% !important;
+    max-width: none !important;
+  }
+
+  #hon-modal.hon-compact-mode .hon-vs-container > .hon-image-card,
+  #hon-modal.hon-compact-mode .hon-vs-container > .hon-scene-card:not(.hon-performer-card) {
+    width: min(720px, calc((100vw - 260px) / 2)) !important;
+    max-width: min(720px, calc((100vw - 260px) / 2)) !important;
+  }
+
+  #hon-modal.hon-compact-mode .hon-vs-container > .hon-performer-card.hon-has-extra-images {
+    width: min(1000px, calc((100vw - 260px) / 2)) !important;
+    max-width: min(1000px, calc((100vw - 260px) / 2)) !important;
+  }
+}
+
 

@@ -5291,6 +5291,21 @@ Match Stats:`;
   function getCardDisplayOption2(key, defaultValue = false) {
     return state.cardDisplayOptions?.[key] ?? defaultValue;
   }
+  function getCompactModeEnabled() {
+    try {
+      return localStorage.getItem("hon_compact_mode") === "true";
+    } catch (err) {
+      console.warn("[Ascension] Could not load compact mode setting:", err);
+      return false;
+    }
+  }
+  function setCompactModeEnabled(enabled) {
+    try {
+      localStorage.setItem("hon_compact_mode", String(enabled));
+    } catch (err) {
+      console.warn("[Ascension] Could not save compact mode setting:", err);
+    }
+  }
   function setCardDisplayOption(key, value) {
     if (!state.cardDisplayOptions) {
       state.cardDisplayOptions = getDefaultCardDisplayOptions();
@@ -6140,6 +6155,7 @@ Match Stats:`;
     });
   }
   function renderOptionsPanel() {
+    const compactModeEnabled = getCompactModeEnabled();
     const noGenderWarning = state.selectedGenders.length === 0 ? '<p class="hon-options-hint hon-options-warning">Please select at least one gender to continue.</p>' : '<p class="hon-options-hint">Select which genders to include in matchups.</p>';
     const tierWarningHTML = getTierGapWarningHTML(state.selectedTiers);
     const overrideEnabled = getUserFilterOverrideEnabled();
@@ -6200,6 +6216,17 @@ Match Stats:`;
               </label>
             `;
     }).join("")}
+        </div>
+      </div>
+
+      <div class="hon-options-section">
+        <h3 class="hon-options-section-title">Layout</h3>
+        <div class="hon-options-gender-grid">
+          <label class="hon-options-checkbox ${compactModeEnabled ? "active" : ""}" data-compact-mode>
+            <input type="checkbox" ${compactModeEnabled ? "checked" : ""}>
+            <span class="hon-options-checkmark">\u2713</span>
+            <span class="hon-options-label-text">Compact mode</span>
+          </label>
         </div>
       </div>
 
@@ -6313,6 +6340,15 @@ Match Stats:`;
         syncCardDisplayCheckboxUI(vsContainer);
       });
     });
+    const compactModeCheckbox = vsContainer.querySelector('[data-compact-mode] input[type="checkbox"]');
+    if (compactModeCheckbox) {
+      compactModeCheckbox.addEventListener("change", (e) => {
+        const enabled = e.target.checked;
+        setCompactModeEnabled(enabled);
+        e.target.closest(".hon-options-checkbox")?.classList.toggle("active", enabled);
+        document.getElementById("hon-modal")?.classList.toggle("hon-compact-mode", enabled);
+      });
+    }
     const badgeCheckboxes = vsContainer.querySelectorAll('.hon-options-checkbox[data-badge-display] input[type="checkbox"]');
     badgeCheckboxes.forEach((checkbox) => {
       checkbox.addEventListener("change", (e) => {
@@ -10376,6 +10412,13 @@ Match Stats:`;
           modalBackdrop.onclick = () => closeRankingModal();
       }
       modal.classList.remove("hon-modal-closing");
+      let compactModeEnabled = false;
+      try {
+        compactModeEnabled = localStorage.getItem("hon_compact_mode") === "true";
+      } catch (err) {
+        console.warn("[Ascension] Could not load compact mode setting:", err);
+      }
+      modal.classList.toggle("hon-compact-mode", compactModeEnabled);
       modal.style.display = "flex";
       modal.style.alignItems = "center";
       modal.style.justifyContent = "center";
