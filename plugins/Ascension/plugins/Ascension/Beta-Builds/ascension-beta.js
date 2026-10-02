@@ -5291,20 +5291,23 @@ Match Stats:`;
   function getCardDisplayOption2(key, defaultValue = false) {
     return state.cardDisplayOptions?.[key] ?? defaultValue;
   }
-  function getCompactModeEnabled() {
+  function getLayoutOptionEnabled(key) {
     try {
-      return localStorage.getItem("hon_compact_mode") === "true";
+      return localStorage.getItem(key) === "true";
     } catch (err) {
-      console.warn("[Ascension] Could not load compact mode setting:", err);
+      console.warn(`[Ascension] Could not load layout setting ${key}:`, err);
       return false;
     }
   }
-  function setCompactModeEnabled(enabled) {
+  function setLayoutOptionEnabled(key, enabled) {
     try {
-      localStorage.setItem("hon_compact_mode", String(enabled));
+      localStorage.setItem(key, String(enabled));
     } catch (err) {
-      console.warn("[Ascension] Could not save compact mode setting:", err);
+      console.warn(`[Ascension] Could not save layout setting ${key}:`, err);
     }
+  }
+  function getCompactModeEnabled() {
+    return getLayoutOptionEnabled("hon_compact_mode");
   }
   function setCardDisplayOption(key, value) {
     if (!state.cardDisplayOptions) {
@@ -6156,6 +6159,8 @@ Match Stats:`;
   }
   function renderOptionsPanel() {
     const compactModeEnabled = getCompactModeEnabled();
+    const hideLogEnabled = getLayoutOptionEnabled("hon_hide_log");
+    const hoverExpandEnabled = getLayoutOptionEnabled("hon_hover_expand_image");
     const noGenderWarning = state.selectedGenders.length === 0 ? '<p class="hon-options-hint hon-options-warning">Please select at least one gender to continue.</p>' : '<p class="hon-options-hint">Select which genders to include in matchups.</p>';
     const tierWarningHTML = getTierGapWarningHTML(state.selectedTiers);
     const overrideEnabled = getUserFilterOverrideEnabled();
@@ -6226,6 +6231,16 @@ Match Stats:`;
             <input type="checkbox" ${compactModeEnabled ? "checked" : ""}>
             <span class="hon-options-checkmark">\u2713</span>
             <span class="hon-options-label-text">Compact mode</span>
+          </label>
+          <label class="hon-options-checkbox ${hideLogEnabled ? "active" : ""}" data-layout-option="hon_hide_log">
+            <input type="checkbox" ${hideLogEnabled ? "checked" : ""}>
+            <span class="hon-options-checkmark">\u2713</span>
+            <span class="hon-options-label-text">Hide log</span>
+          </label>
+          <label class="hon-options-checkbox ${hoverExpandEnabled ? "active" : ""}" data-layout-option="hon_hover_expand_image">
+            <input type="checkbox" ${hoverExpandEnabled ? "checked" : ""}>
+            <span class="hon-options-checkmark">\u2713</span>
+            <span class="hon-options-label-text">Hover to expand image</span>
           </label>
         </div>
       </div>
@@ -6344,11 +6359,28 @@ Match Stats:`;
     if (compactModeCheckbox) {
       compactModeCheckbox.addEventListener("change", (e) => {
         const enabled = e.target.checked;
-        setCompactModeEnabled(enabled);
+        setLayoutOptionEnabled("hon_compact_mode", enabled);
         e.target.closest(".hon-options-checkbox")?.classList.toggle("active", enabled);
         document.getElementById("hon-modal")?.classList.toggle("hon-compact-mode", enabled);
       });
     }
+    const layoutOptionCheckboxes = vsContainer.querySelectorAll('[data-layout-option] input[type="checkbox"]');
+    layoutOptionCheckboxes.forEach((checkbox) => {
+      checkbox.addEventListener("change", (e) => {
+        const label = e.target.closest("[data-layout-option]");
+        const key = label?.dataset.layoutOption;
+        if (!key)
+          return;
+        const enabled = e.target.checked;
+        setLayoutOptionEnabled(key, enabled);
+        label.classList.toggle("active", enabled);
+        const modal = document.getElementById("hon-modal");
+        if (modal) {
+          const className = key === "hon_hide_log" ? "hon-hide-log" : "hon-hover-expand-enabled";
+          modal.classList.toggle(className, enabled);
+        }
+      });
+    });
     const badgeCheckboxes = vsContainer.querySelectorAll('.hon-options-checkbox[data-badge-display] input[type="checkbox"]');
     badgeCheckboxes.forEach((checkbox) => {
       checkbox.addEventListener("change", (e) => {
@@ -8210,6 +8242,27 @@ Match Stats:`;
       focusTimeout = null;
       clickTimeout = null;
     };
+    const galleryImageContainers = area.querySelectorAll(".hon-performer-card.hon-has-extra-images .hon-performer-image-container");
+    galleryImageContainers.forEach((imageContainer) => {
+      const card = imageContainer.closest(".hon-performer-card");
+      const imageClickHandler = (event) => {
+        const image = event.target instanceof Element ? event.target.closest("img.hon-performer-image, img.hon-gallery-extra-img") : null;
+        if (!image || !card?.dataset.performerId)
+          return;
+        event.preventDefault();
+        event.stopPropagation();
+        const link = document.createElement("a");
+        link.href = `/performers/${card.dataset.performerId}`;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.style.display = "none";
+        document.body.appendChild(link);
+        link.click();
+        setTimeout(() => link.remove(), 0);
+      };
+      imageContainer.addEventListener("click", imageClickHandler);
+      cleanupFunctions2.push(() => imageContainer.removeEventListener("click", imageClickHandler));
+    });
     if (isMobile()) {
       const clearAutoPlay = () => {
         if (autoPlayTimeout) {
@@ -10263,6 +10316,91 @@ Match Stats:`;
       buttonObserver = null;
     }
   }
+  function setupHoverImagePreview(modal) {
+    const imageSelector = ".hon-performer-image, .hon-scene-image, .hon-gallery-extra-img, .hon-image-image-container img";
+    let preview = null;
+    let previewTimer = null;
+    let activeImage = null;
+    let pointerX = 0;
+    let pointerY = 0;
+    const hidePreview = () => {
+      window.clearTimeout(previewTimer);
+      previewTimer = null;
+      preview?.remove();
+      preview = null;
+      activeImage = null;
+    };
+    const positionPreview = () => {
+      if (!preview)
+        return;
+      const bounds = preview.getBoundingClientRect();
+      const gap = 20;
+      const edge = 12;
+      let left = pointerX + gap;
+      let top = pointerY + gap;
+      if (left + bounds.width > window.innerWidth - edge)
+        left = pointerX - bounds.width - gap;
+      if (top + bounds.height > window.innerHeight - edge)
+        top = pointerY - bounds.height - gap;
+      preview.style.left = `${Math.max(edge, Math.min(left, window.innerWidth - bounds.width - edge))}px`;
+      preview.style.top = `${Math.max(edge, Math.min(top, window.innerHeight - bounds.height - edge))}px`;
+    };
+    const canPreview = () => window.innerWidth > 1200 && window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+    modal.addEventListener("pointerover", (event) => {
+      if (event.pointerType !== "mouse" || !canPreview() || !modal.classList.contains("hon-hover-expand-enabled"))
+        return;
+      const image = event.target instanceof HTMLImageElement ? event.target.closest(imageSelector) : null;
+      if (!image || image === activeImage)
+        return;
+      hidePreview();
+      activeImage = image;
+      pointerX = event.clientX;
+      pointerY = event.clientY;
+      previewTimer = window.setTimeout(() => {
+        previewTimer = null;
+        if (!activeImage?.isConnected || !modal.classList.contains("hon-hover-expand-enabled")) {
+          hidePreview();
+          return;
+        }
+        preview = document.createElement("img");
+        preview.className = "hon-hover-expanded-image";
+        preview.alt = activeImage.alt || "";
+        preview.src = activeImage.currentSrc || activeImage.src;
+        preview.style.visibility = "hidden";
+        const showPreview = () => {
+          if (!preview)
+            return;
+          preview.style.visibility = "visible";
+          positionPreview();
+          requestAnimationFrame(() => preview?.classList.add("hon-hover-preview-visible"));
+        };
+        preview.addEventListener("load", showPreview, { once: true });
+        preview.addEventListener("error", hidePreview, { once: true });
+        document.body.appendChild(preview);
+        if (preview.complete && preview.naturalWidth > 0)
+          showPreview();
+      }, 500);
+    });
+    modal.addEventListener("pointermove", (event) => {
+      if (!activeImage)
+        return;
+      if (event.pointerType !== "mouse" || !canPreview() || !modal.classList.contains("hon-hover-expand-enabled") || !activeImage?.isConnected) {
+        hidePreview();
+        return;
+      }
+      pointerX = event.clientX;
+      pointerY = event.clientY;
+      if (preview)
+        positionPreview();
+    });
+    modal.addEventListener("pointerout", (event) => {
+      const image = event.target instanceof HTMLImageElement ? event.target.closest(imageSelector) : null;
+      const relatedTarget = event.relatedTarget;
+      if (image === activeImage && (!relatedTarget || !(relatedTarget instanceof Node) || !image.contains(relatedTarget)))
+        hidePreview();
+    });
+    modal._hideHoverImagePreview = hidePreview;
+  }
   function finishModalClose() {
     const gameModal = document.getElementById("hon-modal");
     const statsModal = document.getElementById("hon-stats-modal");
@@ -10272,6 +10410,7 @@ Match Stats:`;
       return;
     }
     if (gameModal) {
+      gameModal._hideHoverImagePreview?.();
       gameModal.style.display = "none";
       gameModal.classList.remove("hon-modal-opening", "hon-modal-closing");
     }
@@ -10286,6 +10425,7 @@ Match Stats:`;
   function closeRankingModal() {
     const gameModal = document.getElementById("hon-modal");
     const statsModal = document.getElementById("hon-stats-modal");
+    gameModal?._hideHoverImagePreview?.();
     if (statsModal)
       statsModal.style.display = "none";
     if (!gameModal || gameModal.style.display === "none" || closeAnimationInProgress) {
@@ -10393,6 +10533,7 @@ Match Stats:`;
           modal.appendChild(style);
         }
         document.body.appendChild(modal);
+        setupHoverImagePreview(modal);
         const sidebarContainer = modal.querySelector("#hon-sidebar");
         if (sidebarContainer) {
           attachSidebarEventListeners(modal);
@@ -10413,12 +10554,18 @@ Match Stats:`;
       }
       modal.classList.remove("hon-modal-closing");
       let compactModeEnabled = false;
+      let hideLogEnabled = false;
+      let hoverExpandEnabled = false;
       try {
         compactModeEnabled = localStorage.getItem("hon_compact_mode") === "true";
+        hideLogEnabled = localStorage.getItem("hon_hide_log") === "true";
+        hoverExpandEnabled = localStorage.getItem("hon_hover_expand_image") === "true";
       } catch (err) {
-        console.warn("[Ascension] Could not load compact mode setting:", err);
+        console.warn("[Ascension] Could not load layout settings:", err);
       }
       modal.classList.toggle("hon-compact-mode", compactModeEnabled);
+      modal.classList.toggle("hon-hide-log", hideLogEnabled);
+      modal.classList.toggle("hon-hover-expand-enabled", hoverExpandEnabled);
       modal.style.display = "flex";
       modal.style.alignItems = "center";
       modal.style.justifyContent = "center";
