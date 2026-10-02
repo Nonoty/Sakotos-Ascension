@@ -7280,6 +7280,8 @@ Match Stats:`;
       pairSnapshot: {
         left: state.currentPair.left ? { ...state.currentPair.left } : null,
         right: state.currentPair.right ? { ...state.currentPair.right } : null,
+        leftExtraImages: state.currentPair.leftExtraImages || null,
+        rightExtraImages: state.currentPair.rightExtraImages || null,
         rankLeft: state.currentRanks.left,
         rankRight: state.currentRanks.right
       },
@@ -7681,7 +7683,12 @@ Match Stats:`;
     let restoredPairSnapshot = null;
     if (last.pairSnapshot) {
       const { left, right } = last.pairSnapshot;
-      state.currentPair = { left, right };
+      state.currentPair = {
+        left,
+        right,
+        leftExtraImages: last.pairSnapshot.leftExtraImages || null,
+        rightExtraImages: last.pairSnapshot.rightExtraImages || null
+      };
       state.currentRanks = { left: last.pairSnapshot.rankLeft, right: last.pairSnapshot.rankRight };
       restoredPairSnapshot = last.pairSnapshot;
       console.log("[Ascension] Restored pair snapshot");
@@ -8014,11 +8021,12 @@ Match Stats:`;
           state.disableChoice = false;
           area.innerHTML = `
           <div class="hon-vs-container">
-            ${renderCard2(pairSnapshot.left, "left", pairSnapshot.rankLeft)}
+            ${renderCard2(pairSnapshot.left, "left", pairSnapshot.rankLeft, pairSnapshot.leftExtraImages)}
             <div class="hon-vs-divider"><span>VS</span></div>
-            ${renderCard2(pairSnapshot.right, "right", pairSnapshot.rankRight)}
+            ${renderCard2(pairSnapshot.right, "right", pairSnapshot.rankRight, pairSnapshot.rightExtraImages)}
           </div>
         `;
+          attachGalleryRefreshHandlers(area);
           attachBattleListeners2(area);
         }
         console.log("[Ascension] Undo successful \u2014 previous pair restored.");
@@ -8490,6 +8498,8 @@ Match Stats:`;
           fetchPerformerExtraImages(right.id)
         ]);
       }
+      state.currentPair.leftExtraImages = leftExtraImages;
+      state.currentPair.rightExtraImages = rightExtraImages;
       const oldContainer = area.querySelector(".hon-vs-container");
       const newContainer = document.createElement("div");
       newContainer.className = "hon-vs-container hon-pair-entering";
