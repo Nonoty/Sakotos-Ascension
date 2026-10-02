@@ -1678,6 +1678,226 @@
   function getCardDisplayOption(key) {
     return state.cardDisplayOptions?.[key] === true;
   }
+  function shouldDisplayExtraImages() {
+    return getCardDisplayOption2("DisplayExtraImages", false) && window.innerWidth >= 1201;
+  }
+  function shouldEnableMobileExtraImageRefresh() {
+    return getCardDisplayOption2("DisplayExtraImages", false) && window.innerWidth < 1201;
+  }
+  const galleryImagePools = new Map();
+  const GALLERY_PAGE_SIZE = 5;
+  async function fetchGalleryPage(performerId, orientation, seed, page) {
+    const query = `
+      query FindPerformerExtraImages($image_filter: ImageFilterType, $filter: FindFilterType) {
+        findImages(image_filter: $image_filter, filter: $filter) {
+          count
+          images { paths { thumbnail } }
+        }
+      }
+    `;
+    const result = await graphqlQuery(query, {
+      image_filter: {
+        performers: { value: [performerId], modifier: "INCLUDES" },
+        orientation: { value: [orientation === "Landscape" ? "LANDSCAPE" : "PORTRAIT"] }
+      },
+      filter: { per_page: GALLERY_PAGE_SIZE, page, sort: `random_${seed}` }
+    });
+    return {
+      thumbnails: (result.findImages?.images || []).map((img) => img.paths?.thumbnail).filter(Boolean),
+      total: result.findImages?.count || 0
+    };
+  }
+  async function ensureGalleryPool(performerId) {
+    if (galleryImagePools.has(performerId)) {
+      return galleryImagePools.get(performerId);
+    }
+    const seed = Math.floor(Math.random() * 99999999);
+    const pool = {
+      seed,
+      lPage: 1,
+      pPage: 1,
+      landscape: [],
+      portrait: [],
+      lTotal: 0,
+      pTotal: 0,
+      lExhausted: false,
+      pExhausted: false,
+      seen: new Set()
+    };
+    try {
+      const [landscape, portrait] = await Promise.all([
+        fetchGalleryPage(performerId, "Landscape", seed, 1),
+        fetchGalleryPage(performerId, "Portrait", seed, 1)
+      ]);
+      pool.landscape = landscape.thumbnails;
+      pool.portrait = portrait.thumbnails;
+      pool.lTotal = landscape.total;
+      pool.pTotal = portrait.total;
+      if (landscape.thumbnails.length < GALLERY_PAGE_SIZE)
+        pool.lExhausted = true;
+      if (portrait.thumbnails.length < GALLERY_PAGE_SIZE)
+        pool.pExhausted = true;
+    } catch (e) {
+      console.warn("[Ascension] Failed to fetch gallery pool for performer", performerId, e);
+    }
+    galleryImagePools.set(performerId, pool);
+    return pool;
+  }
+  async function getFreeBucket(pool, performerId, orientation) {
+    const isLandscape = orientation === "Landscape";
+    const bucketKey = isLandscape ? "landscape" : "portrait";
+    const pageKey = isLandscape ? "lPage" : "pPage";
+    const exhaustedKey = isLandscape ? "lExhausted" : "pExhausted";
+    let fresh = pool[bucketKey].filter((url) => !pool.seen.has(url));
+    if (fresh.length === 0 && !pool[exhaustedKey]) {
+      pool[pageKey] += 1;
+      try {
+        const more = await fetchGalleryPage(performerId, orientation, pool.seed, pool[pageKey]);
+        pool[bucketKey].push(...more.thumbnails);
+        if (more.thumbnails.length < GALLERY_PAGE_SIZE)
+          pool[exhaustedKey] = true;
+      } catch (e) {
+        console.warn("[Ascension] Failed to fetch next gallery page", e);
+        pool[exhaustedKey] = true;
+      }
+      fresh = pool[bucketKey].filter((url) => !pool.seen.has(url));
+    }
+    return fresh;
+  }
+  async function fetchPerformerExtraImages(performerId) {
+    const pool = await ensureGalleryPool(performerId);
+    let freshL = await getFreeBucket(pool, performerId, "Landscape");
+    let freshP = await getFreeBucket(pool, performerId, "Portrait");
+    const canL = freshL.length >= 1;
+    const canP = freshP.length >= 2;
+    if (!canL && !canP) {
+      pool.seen.clear();
+      freshL = await getFreeBucket(pool, performerId, "Landscape");
+      freshP = await getFreeBucket(pool, performerId, "Portrait");
+    }
+    const canL2 = freshL.length >= 1;
+    const canP2 = freshP.length >= 2;
+    const canP1 = freshP.length >= 1;
+    let useLandscape = false;
+    if (canL2 && canP2) {
+      useLandscape = Math.random() < 0.5;
+    } else if (canL2) {
+      useLandscape = true;
+    } else if (canP2) {
+      useLandscape = false;
+    } else if (canP1) {
+      useLandscape = false;
+    } else {
+      return { thumbnails: [], single: true, lonePortrait: false, hasMore: false };
+    }
+    let selected = [];
+    if (useLandscape) {
+      selected = [freshL[Math.floor(Math.random() * freshL.length)]];
+    } else if (freshP.length >= 2) {
+      const idx1 = Math.floor(Math.random() * freshP.length);
+      let idx2 = Math.floor(Math.random() * (freshP.length - 1));
+      if (idx2 >= idx1)
+        idx2 += 1;
+      selected = [freshP[idx1], freshP[idx2]];
+    } else {
+      selected = [freshP[0]];
+    }
+    selected.forEach((url) => pool.seen.add(url));
+    const totalImages = (pool.lTotal || 0) + (pool.pTotal || 0);
+    const remainingInPool = (pool.landscape.length + pool.portrait.length) - pool.seen.size;
+    const hasMore = selected.length > 0 && (totalImages > selected.length || remainingInPool > 0 || !pool.lExhausted || !pool.pExhausted);
+    const lonePortrait = !useLandscape && selected.length === 1;
+    return {
+      thumbnails: selected,
+      single: useLandscape || selected.length === 1,
+      lonePortrait,
+      hasMore
+    };
+  }
+  function buildGalleryExtrasHtml(extraData, performerId) {
+    const { thumbnails = [], single = false, lonePortrait = false, hasMore = false } = extraData || {};
+    const sliceClass = single ? " hon-gallery-single" : "";
+    const lonePortraitClass = lonePortrait ? " hon-gallery-lone-portrait" : "";
+    const imgs = thumbnails.map((src) => `<img class="hon-gallery-extra-img" src="${src}" loading="lazy" alt="" />`).join("\n      ");
+    const isMobileSingleRefresh = window.innerWidth < 1201 && getCardDisplayOption2("DisplayExtraImages", false);
+    const refreshBtn = hasMore || isMobileSingleRefresh ? `<button class="hon-gallery-refresh-btn" title="Refresh images" type="button">\u21BA</button>` : "";
+    return `
+      <div class="hon-image-gallery-extras${sliceClass}${lonePortraitClass}" data-performer-id="${performerId}">
+        ${imgs}
+        ${refreshBtn}
+      </div>`;
+  }
+  function attachGalleryRefreshHandlers(root) {
+    if (!root || typeof root.querySelectorAll !== "function")
+      return;
+    root.querySelectorAll(".hon-gallery-refresh-btn").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const extrasEl = btn.closest(".hon-image-gallery-extras");
+        if (!extrasEl)
+          return;
+        const performerId = extrasEl.dataset.performerId;
+        if (!performerId)
+          return;
+        const isMobileSingleRefresh = window.innerWidth < 1201 && getCardDisplayOption2("DisplayExtraImages", false);
+        btn.disabled = true;
+        btn.textContent = "\u231B";
+        const data = await fetchPerformerExtraImages(performerId);
+        if (isMobileSingleRefresh) {
+          const galleryRoot = extrasEl.closest(".hon-mobile-refresh-gallery");
+          if (galleryRoot) {
+            galleryRoot.classList.add("hon-mobile-active");
+          }
+          extrasEl.classList.add("hon-mobile-active");
+          extrasEl.classList.toggle("hon-gallery-single", data.single);
+          extrasEl.classList.toggle("hon-gallery-lone-portrait", data.lonePortrait);
+          extrasEl.querySelectorAll(".hon-gallery-extra-img").forEach((el) => el.remove());
+          data.thumbnails.forEach((src) => {
+            const img = document.createElement("img");
+            img.className = "hon-gallery-extra-img";
+            img.src = src;
+            img.loading = "lazy";
+            img.alt = "";
+            extrasEl.appendChild(img);
+          });
+          const refreshBtn = extrasEl.querySelector(".hon-gallery-refresh-btn");
+          if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = "\u21BA";
+          }
+          return;
+        }
+        extrasEl.classList.toggle("hon-gallery-single", data.single);
+        extrasEl.classList.toggle("hon-gallery-lone-portrait", data.lonePortrait);
+        extrasEl.querySelectorAll(".hon-gallery-extra-img").forEach((el) => el.remove());
+        const existingBtn = extrasEl.querySelector(".hon-gallery-refresh-btn");
+        if (data.hasMore && !existingBtn) {
+          const newBtn = document.createElement("button");
+          newBtn.type = "button";
+          newBtn.className = "hon-gallery-refresh-btn";
+          newBtn.title = "Refresh images";
+          newBtn.textContent = "\u21BA";
+          extrasEl.appendChild(newBtn);
+          attachGalleryRefreshHandlers(extrasEl);
+        } else if (!data.hasMore && existingBtn) {
+          existingBtn.remove();
+        }
+        data.thumbnails.forEach((src) => {
+          const img = document.createElement("img");
+          img.className = "hon-gallery-extra-img";
+          img.src = src;
+          img.loading = "lazy";
+          img.alt = "";
+          const refreshBtn = extrasEl.querySelector(".hon-gallery-refresh-btn");
+          extrasEl.insertBefore(img, refreshBtn || null);
+        });
+        if (btn.isConnected) {
+          btn.disabled = false;
+          btn.textContent = "\u21BA";
+        }
+      });
+    });
+  }
   function formatHeight(heightCm) {
     if (!heightCm)
       return null;
@@ -1686,10 +1906,10 @@
     const inches = totalInches % 12;
     return `${feet}\u2032${inches}\u2033 (${heightCm} cm)`;
   }
-  function renderCard(item, side, rank) {
+  function renderCard(item, side, rank, extraImages = null) {
     const gauntletStreak = state.gauntletChampion?.id === item.id ? state.gauntletWins : null;
     if (state.battleType === "performers")
-      return createPerformerCard(item, side, rank, gauntletStreak);
+      return createPerformerCard(item, side, rank, gauntletStreak, extraImages);
     if (state.battleType === "images")
       return createImageCard(item, side, rank, gauntletStreak);
     if (state.battleType === "scenes")
@@ -1801,7 +2021,7 @@
     );
     return htmlParts.join("");
   }
-  function createPerformerCard(performer, side, rank = null, gauntletStreak = null) {
+  function createPerformerCard(performer, side, rank = null, gauntletStreak = null, extraImages = null) {
     const name = performer.name || `Performer #${performer.id}`;
     const imagePath = performer.image_path;
     const rawRating = performer.rating100 ?? 1;
@@ -1916,9 +2136,14 @@
     const pictureOnlyClass = isPictureOnly ? "hon-picture-only" : "";
     const imageWinnerAttr = isPictureOnly ? ` data-winner="${performer.id}"` : "";
     const performerImageHtml = imagePath ? `<img class="hon-performer-image hon-scene-image" src="${imagePath}" alt="${name}" />` : `<div class="hon-no-image">No Image</div>`;
-    const imageContainerInner = isPictureOnly ? performerImageHtml : `<a href="/performers/${performer.id}" target="_blank" class="hon-performer-link">${performerImageHtml}</a>`;
+    const desktopGalleryEnabled = shouldDisplayExtraImages() && extraImages && Array.isArray(extraImages.thumbnails) && extraImages.thumbnails.length > 0;
+    const mobileRefreshEnabled = shouldEnableMobileExtraImageRefresh() && extraImages && Array.isArray(extraImages.thumbnails) && extraImages.thumbnails.length > 0;
+    const hasGallery = desktopGalleryEnabled;
+    const galleryHtml = hasGallery ? buildGalleryExtrasHtml(extraImages, performer.id) : "";
+    const mobileRefreshHtml = mobileRefreshEnabled ? buildGalleryExtrasHtml(extraImages, performer.id) : "";
+    const imageContainerInner = hasGallery ? `<div class="hon-image-gallery-main">${performerImageHtml}</div>${galleryHtml}` : mobileRefreshEnabled ? `<div class="hon-image-gallery-main hon-mobile-refresh-gallery">${performerImageHtml}${mobileRefreshHtml}</div>` : isPictureOnly ? performerImageHtml : `<a href="/performers/${performer.id}" target="_blank" class="hon-performer-link">${performerImageHtml}</a>`;
     return `
-    <div class="hon-performer-card hon-scene-card hon-card-enter hon-card-enter-${side}${tierClass}${pictureOnlyClass ? " " + pictureOnlyClass : ""}" data-performer-id="${performer.id}" data-side="${side}" data-rating="${performer.rating100 || 1}" data-asc-score="${battleScore?.toFixed(2) ?? ""}">
+    <div class="hon-performer-card hon-scene-card hon-card-enter hon-card-enter-${side}${tierClass}${pictureOnlyClass ? " " + pictureOnlyClass : ""}${hasGallery ? " hon-has-extra-images" : ""}" data-performer-id="${performer.id}" data-side="${side}" data-rating="${performer.rating100 || 1}" data-asc-score="${battleScore?.toFixed(2) ?? ""}">
       <div class="hon-performer-image-container hon-scene-image-container"${imageWinnerAttr}>
         ${imageContainerInner}
         ${currentStreakDisplay}
@@ -5088,11 +5313,12 @@ Match Stats:`;
   }
   function toggleCardDisplayOption(key, checked) {
     const currentPOM = getPictureOnlyMode();
+    const compatibleWithPictureOnly = key === "DisplayExtraImages";
     if (key === PICTURE_ONLY_MODE_KEY) {
       setPictureOnlyMode(checked);
       return;
     }
-    if (currentPOM) {
+    if (currentPOM && !compatibleWithPictureOnly) {
       setCardDisplayOption(PICTURE_ONLY_MODE_KEY, false);
       setCardDisplayOption(key, checked);
       return;
@@ -6280,6 +6506,7 @@ Match Stats:`;
       CARD_DISPLAY_LS_KEY = "hon_card_display_options";
       CARD_DISPLAY_OPTIONS = [
         { key: "PictureOnlyMode", label: "Picture Only Mode" },
+        { key: "DisplayExtraImages", label: "Display Extra Images" },
         { key: "HidePerformerName", label: "Hide Performer Name" },
         { key: "HideAscendedScore", label: "Hide Ascended Score" },
         { key: "HideCountry", label: "Hide Country" },
@@ -6292,7 +6519,7 @@ Match Stats:`;
         { key: "HideMediaCounters", label: "Hide Media Counters" }
       ];
       PICTURE_ONLY_MODE_KEY = "PictureOnlyMode";
-      ALL_HIDE_OPTIONS = CARD_DISPLAY_OPTIONS.map((opt) => opt.key).filter((key) => key !== PICTURE_ONLY_MODE_KEY);
+      ALL_HIDE_OPTIONS = CARD_DISPLAY_OPTIONS.map((opt) => opt.key).filter((key) => key !== PICTURE_ONLY_MODE_KEY && key !== "DisplayExtraImages");
       BADGE_DISPLAY_LS_KEY = "hon_badge_display_options";
       BADGE_DISPLAY_OPTIONS = [
         { key: "HideAscRankBadge", label: "Hide Ascension Rank Badge" },
@@ -8255,13 +8482,21 @@ Match Stats:`;
       const [left, right] = result.items;
       state.currentPair = { left, right };
       state.currentRanks = { left: result.ranks[0], right: result.ranks[1] };
+      let leftExtraImages = null;
+      let rightExtraImages = null;
+      if (state.battleType === "performers" && (shouldDisplayExtraImages() || shouldEnableMobileExtraImageRefresh())) {
+        [leftExtraImages, rightExtraImages] = await Promise.all([
+          fetchPerformerExtraImages(left.id),
+          fetchPerformerExtraImages(right.id)
+        ]);
+      }
       const oldContainer = area.querySelector(".hon-vs-container");
       const newContainer = document.createElement("div");
       newContainer.className = "hon-vs-container hon-pair-entering";
       newContainer.innerHTML = `
-      ${renderCard(left, "left", result.ranks[0])}
+      ${renderCard(left, "left", result.ranks[0], leftExtraImages)}
       <div class="hon-vs-divider"><span>VS</span></div>
-      ${renderCard(right, "right", result.ranks[1])}
+      ${renderCard(right, "right", result.ranks[1], rightExtraImages)}
     `;
       if (oldContainer) {
         oldContainer.replaceWith(newContainer);
@@ -8269,6 +8504,7 @@ Match Stats:`;
         area.innerHTML = "";
         area.appendChild(newContainer);
       }
+      attachGalleryRefreshHandlers(newContainer);
       attachBattleListeners(area);
     } catch (err) {
       area.innerHTML = `<div class="hon-error">Error: ${err.message}</div>`;
