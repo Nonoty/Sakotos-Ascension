@@ -1770,6 +1770,14 @@
     let freshP = await getFreeBucket(pool, performerId, "Portrait");
     const landscapeCountNeeded = mobileLayout ? 2 : 1;
     const portraitCountNeeded = mobileLayout ? 1 : 2;
+    if (pool.lExhausted && pool.lTotal >= landscapeCountNeeded && freshL.length < landscapeCountNeeded) {
+      pool.landscape.forEach((url) => pool.seen.delete(url));
+      freshL = pool.landscape.slice();
+    }
+    if (pool.pExhausted && pool.pTotal >= portraitCountNeeded && freshP.length < portraitCountNeeded) {
+      pool.portrait.forEach((url) => pool.seen.delete(url));
+      freshP = pool.portrait.slice();
+    }
     const canL = freshL.length >= landscapeCountNeeded;
     const canP = freshP.length >= portraitCountNeeded;
     if (!canL && !canP) {
